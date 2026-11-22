@@ -1,0 +1,22 @@
+# 小红书图文创作流水线（与 content_pipeline 并列的平台工作流）
+#
+# 流程：资料 → 选题大纲(直接产出页清单:封面/内容/总结) → 正文文案+标签 → 图组成片(宿主自执) → 定稿
+# 与公众号 content_pipeline 的差异：产物是「图组 + 短文案」而非长文单配图。
+#   - outline 节点直接产出按页拆分的大纲（[封面]/[内容]/[总结] 标记），宿主侧 page_planner 解析成页清单
+#   - image_batch 是宿主执行节点（重 IO），由柳如烟 studio 自执：封面先行→内容页用封面作参考→SSE→落盘
+#     引擎永不见此类型（studio run_step 在调 ai-content 子进程前拦截）；reads 里 outline 即页清单来源
+id: xhs_pipeline
+name: 小红书图文创作
+inputs: [topic, platform, sources]
+
+roles:
+  planner: prompts/xhs/planner.md
+  copywriter: prompts/xhs/copywriter.md
+  finalizer: prompts/xhs/finalizer.md
+
+nodes:
+  - {id: collect,     type: data,        tool: content.gather,                                  writes: data}
+  - {id: outline,     type: agent,       role: planner,     reads: [topic, data.material],       writes: outline}
+  - {id: copy,        type: agent,       role: copywriter,  reads: [outline, data.material],     writes: copy}
+  - {id: image_batch, type: image_batch, reads: [outline, copy, topic],                           writes: images}
+  - {id: finalize,    type: agent,       role: finalizer,   reads: [outline, copy],              writes: final}

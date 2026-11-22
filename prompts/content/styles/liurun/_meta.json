@@ -1,0 +1,5 @@
+{
+  "name": "刘润 · 商业理性",
+  "desc": "案例切入+洞察+数据+结论，简洁少 emoji、小标题分层，贯穿选题→撰稿→润色→定稿",
+  "overrides": ["planner", "writer", "style_editor", "finalizer"]
+}

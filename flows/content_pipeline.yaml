@@ -1,0 +1,29 @@
+# 自媒体内容流水线（从 ai-quant definitions.CONTENT_PIPELINE 迁移；配置即工作流）
+#
+# 流程：资料 → 选题大纲 → 撰稿 → 事实核查 → 风格润色 → 配图提示词 → 定稿 → 排版
+# data 节点 collect 的资料由宿主（柳如烟）抓好注入 state.data.material；本项目不自己搜。
+# format 节点：终稿 Markdown → 公众号可粘贴 HTML（content.format），写入 state.layout；
+# 宿主工作台在「排版」步预览 HTML，并可用 layout.html 推送公众号草稿箱。
+id: content_pipeline
+name: 自媒体内容流水线
+# sources 可空：填若干参考链接（URL 列表，或逗号/换行分隔字符串），collect 节点会
+# 抓取正文拼进 material。宿主（柳如烟）注入 data.material 时优先用宿主的，本字段被忽略。
+inputs: [topic, platform, sources]
+
+roles:
+  planner: prompts/content/planner.md
+  writer: prompts/content/writer.md
+  fact_checker: prompts/content/fact_checker.md
+  style_editor: prompts/content/style_editor.md
+  art_director: prompts/content/art_director.md
+  finalizer: prompts/content/finalizer.md
+
+nodes:
+  - {id: collect,     type: data,  tool: content.gather,                                       writes: data}
+  - {id: outline,     type: agent, role: planner,      reads: [topic, data.material],          writes: outline}
+  - {id: draft,       type: agent, role: writer,       reads: [outline, data.material],        writes: draft}
+  - {id: fact,        type: agent, role: fact_checker, reads: [draft, data.material],          writes: fact_report}
+  - {id: style,       type: agent, role: style_editor, reads: [draft, platform],               writes: styled}
+  - {id: image_brief, type: agent, role: art_director, reads: [styled, platform],              writes: image_prompt}
+  - {id: finalize,    type: agent, role: finalizer,    reads: [styled, fact_report],           writes: final}
+  - {id: format,      type: data,  tool: content.format,                                      writes: layout}

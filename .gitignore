@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+.vite/
+
+# Local data & secrets
+data/
+*.secrets.json
+wechat_mp.json
+models.json
+search_config.json
+gateway.json
+.env
+.env.*
+
+# Research / third-party reference repos
+_research/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

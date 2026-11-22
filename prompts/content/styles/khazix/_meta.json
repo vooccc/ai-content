@@ -1,0 +1,5 @@
+{
+  "name": "卡兹克 · AI 科技活人感",
+  "desc": "数字生命卡兹克风格：第一人称、过程叙事、活人感、绝对禁区去 AI 味，贯穿选题→撰稿→润色→定稿",
+  "overrides": ["planner", "writer", "style_editor", "finalizer"]
+}
