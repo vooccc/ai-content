@@ -142,17 +142,36 @@ def generate_image(
     env_key = (os.getenv("AICONTENT_IMAGE_API_KEY") or "").strip()
     env_model = (os.getenv("AICONTENT_IMAGE_MODEL") or "").strip()
 
-    resolved_model = (model or "").strip() or env_model
+    from . import settings_store
+    st_cfg = settings_store.load_settings()
+
+    resolved_model = (model or "").strip() or env_model or str(st_cfg.get("default_image_model") or "").strip()
     provider: Optional[Dict[str, Any]] = None
 
     if env_base:
         provider = {"id": "env", "base_url": env_base, "api_key": env_key}
         if not resolved_model:
             resolved_model = "dall-e-3"
+    elif st_cfg.get("image_base_url") and st_cfg.get("image_api_key"):
+        provider = {
+            "id": "custom_image",
+            "base_url": str(st_cfg["image_base_url"]).strip(),
+            "api_key": str(st_cfg["image_api_key"]).strip(),
+        }
+        if not resolved_model:
+            resolved_model = "dall-e-3"
+    elif st_cfg.get("mode") == "custom" and st_cfg.get("llm_base_url") and st_cfg.get("llm_api_key") and not provider_selector:
+        provider = {
+            "id": "custom",
+            "base_url": str(st_cfg["llm_base_url"]).strip(),
+            "api_key": str(st_cfg["llm_api_key"]).strip(),
+        }
+        if not resolved_model:
+            resolved_model = "dall-e-3"
     else:
         providers = _load_providers()
         if not providers:
-            return {"error": "未配置生图模型：请在 ai-content/data/models.json 或环境变量 AICONTENT_IMAGE_BASE_URL 中配置。"}
+            return {"error": "未配置生图模型：请在「账号与设置 → 模型与连接配置」中配置生图接口或模型。"}
         if resolved_model:
             provider = _find_provider_for_model(providers, resolved_model, provider_selector)
             if not provider:

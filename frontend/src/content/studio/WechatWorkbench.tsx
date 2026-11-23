@@ -239,17 +239,52 @@ export default function WechatWorkbench(p: WorkbenchProps) {
     return draft
   }
   async function dispatchWechat(acc: MPAccount, title: string) {
-    if (!acc.appid || !acc.secret) { setDispatchRes((m) => ({ ...m, [acc.id]: { status: 'err', msg: '未配凭证，去「多平台发布」填' } })); return }
+    if (!acc.appid || !acc.secret) { setDispatchRes((m) => ({ ...m, [acc.id]: { status: 'err', msg: '未配凭证，去「发布与账号」填' } })); return }
     const content = dispatchContent()
     if (!content.trim()) { setDispatchRes((m) => ({ ...m, [acc.id]: { status: 'err', msg: '没有可推送内容，请先完成定稿/排版' } })); return }
     setDispatchRes((m) => ({ ...m, [acc.id]: { status: 'loading', msg: '' } }))
     try {
       const d = await (await fetch(`${API_BASE}/content/dispatch/wechat`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, content, appid: acc.appid, secret: acc.secret, thumb_media_id: acc.thumb_media_id || '', cover_url: coverUrl || '' }),
+        body: JSON.stringify({
+          title,
+          content,
+          appid: acc.appid,
+          secret: acc.secret,
+          thumb_media_id: acc.thumb_media_id || '',
+          cover_url: coverUrl || '',
+          project_id: proj.id,
+          topic_id: proj.topic_id || '',
+          account_id: proj.account_id || 'primary',
+          style: p.stylePick || '',
+          theme: p.themePick || proj.theme || 'moyu_green',
+        }),
       })).json()
-      setDispatchRes((m) => ({ ...m, [acc.id]: d.ok ? { status: 'ok', msg: coverUrl ? '已进草稿箱（用本篇封面）' : '已进草稿箱' } : { status: 'err', msg: d.error || '失败' } }))
+      const imgHint = d.uploaded_images > 0 ? `，自动上传 ${d.uploaded_images} 张正文图` : ''
+      const baseOkMsg = coverUrl ? `已进草稿箱（用本篇封面${imgHint}）` : `已进草稿箱${imgHint}`
+      setDispatchRes((m) => ({ ...m, [acc.id]: d.ok ? { status: 'ok', msg: baseOkMsg } : { status: 'err', msg: d.error || '失败' } }))
     } catch (e) { setDispatchRes((m) => ({ ...m, [acc.id]: { status: 'err', msg: `${e}` } })) }
+  }
+
+  async function applyTheme(themeId: string) {
+    p.setThemePick(themeId)
+    await p.saveSettings({ theme: themeId })
+    try {
+      const res = await fetch(`${API_BASE}/studio/projects/${proj.id}/render-theme`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ theme: themeId }),
+      })
+      const d = await res.json()
+      if (d.ok) {
+        await p.openProject(proj.id, true)
+        setMsg(`✓ 已切换为「${p.themeList.find((x) => x.id === themeId)?.name || themeId}」排版`)
+      } else {
+        setMsg(d.error || '切换主题失败')
+      }
+    } catch (e) {
+      setMsg(`切换主题失败：${e}`)
+    }
   }
   async function dispatchCopy(plat: MPlatform, acc: MPAccount, title: string) {
     const content = dispatchContent()
@@ -447,9 +482,40 @@ export default function WechatWorkbench(p: WorkbenchProps) {
             <>
               <div style={card}>
                 <div style={{ fontSize: 13, opacity: 0.8, marginBottom: 10, lineHeight: 1.65 }}>
-                  把<strong>定稿</strong>转成公众号可粘贴的内联 HTML（按当前写作风格套视觉模板）。
-                  不改写内容；若改过终稿，回到定稿步保存后再点「重新排版」。
+                  把<strong>定稿</strong>转成公众号可粘贴的内联 HTML（严格内联样式，支持正文插图自动进微信图床）。
                 </div>
+                {p.themeList.length > 0 && (
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 6 }}>选择公众号排版主题（点击即时预览）：</div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      {p.themeList.map((t) => {
+                        const active = (p.themePick || 'moyu_green') === t.id
+                        return (
+                          <button
+                            key={t.id}
+                            type="button"
+                            title={t.desc}
+                            onClick={() => applyTheme(t.id)}
+                            style={{
+                              ...ghostBtn,
+                              padding: '5px 11px',
+                              fontSize: 12.5,
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: 6,
+                              borderColor: active ? t.primary : 'rgba(127,127,127,0.3)',
+                              background: active ? 'rgba(196,167,125,0.14)' : 'transparent',
+                              fontWeight: active ? 600 : 400,
+                            }}
+                          >
+                            <span style={{ width: 8, height: 8, borderRadius: '50%', background: t.primary, display: 'inline-block' }} />
+                            {t.name}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
                   <button type="button" style={goBtn} disabled={busy} onClick={() => runStep(sel)}>
                     {busy ? '排版中…' : (isDone ? '↻ 重新排版' : '✨ 生成排版')}

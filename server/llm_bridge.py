@@ -2,13 +2,9 @@
 """ai-content 模型目录与 Gateway 桥接（零依赖柳如烟 backend）。
 
 解析优先级：
-1. Gateway 模式（配置了 ``AICONTENT_GATEWAY_URL`` + ``AICONTENT_GATEWAY_TOKEN`` 或 ``data/gateway.json``）：
-   - 通过标准 OpenAI ``/v1/models`` 获取可用模型；
-   - 所有模型请求统一路由到 Gateway（复用柳如烟的多模型路由、Fallback 与用量统计）。
-2. 本地 ``models.json`` 模式（优先 ``ai-content/data/models.json``，其次兼容只读柳如烟 ``models.json``）：
-   - 过滤 ``enabled=True`` 且 ``transport == "openai_chat"`` 的模型直连厂商；
-   - 列出带 ``image_gen`` 标签的模型供生图选用。
-3. 环境变量兜底（``LLM_BASE_URL`` / ``LLM_API_KEY`` / ``LLM_MODEL``）。
+1. data/settings.json 显式配置（mode == 'gateway' 或 'custom'，或 'auto' 下填了 custom/gateway）
+2. 环境变量（AICONTENT_GATEWAY_URL / AICONTENT_GATEWAY_TOKEN / LLM_BASE_URL / LLM_API_KEY）
+3. 兼容只读本地 models.json（优先 ai-content/data/models.json，其次柳如烟 models.json）
 """
 from __future__ import annotations
 
@@ -18,10 +14,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from . import settings_store
 from .paths import gateway_config_path, models_config_paths
 
 
 def _load_gateway_cfg() -> Optional[Dict[str, str]]:
+    st = settings_store.load_settings()
+    mode = st.get("mode", "auto")
+    if mode == "custom":
+        return None
+    if mode == "gateway" and st.get("gateway_url"):
+        return {
+            "base_url": str(st["gateway_url"]).strip().rstrip("/"),
+            "api_key": str(st.get("gateway_token") or "").strip(),
+            "default_model": str(st.get("default_text_model") or "").strip(),
+        }
+
     url = (os.getenv("AICONTENT_GATEWAY_URL") or "").strip().rstrip("/")
     token = (os.getenv("AICONTENT_GATEWAY_TOKEN") or "").strip()
     default_model = (os.getenv("AICONTENT_GATEWAY_MODEL") or os.getenv("LLM_MODEL") or "").strip()
@@ -39,6 +47,27 @@ def _load_gateway_cfg() -> Optional[Dict[str, str]]:
                 }
         except Exception:
             pass
+    if mode == "auto" and st.get("gateway_url") and st.get("gateway_token"):
+        return {
+            "base_url": str(st["gateway_url"]).strip().rstrip("/"),
+            "api_key": str(st["gateway_token"]).strip(),
+            "default_model": str(st.get("default_text_model") or "").strip(),
+        }
+    return None
+
+
+def _load_custom_cfg() -> Optional[Dict[str, str]]:
+    st = settings_store.load_settings()
+    mode = st.get("mode", "auto")
+    if mode == "gateway":
+        return None
+    if st.get("llm_base_url") and st.get("llm_api_key"):
+        return {
+            "base_url": str(st["llm_base_url"]).strip().rstrip("/"),
+            "api_key": str(st["llm_api_key"]).strip(),
+            "default_model": str(st.get("default_text_model") or "").strip(),
+            "fast_model": str(st.get("fast_text_model") or "").strip(),
+        }
     return None
 
 
@@ -93,24 +122,62 @@ def _gateway_models(gw: Dict[str, str]) -> List[Dict[str, str]]:
         return []
 
 
+def active_source() -> str:
+    st = settings_store.load_settings()
+    mode = st.get("mode", "auto")
+    if mode == "gateway" and st.get("gateway_url"):
+        return "gateway"
+    if mode == "custom" or (mode == "auto" and _load_custom_cfg()):
+        return "custom"
+    if _load_gateway_cfg():
+        return "gateway"
+    providers, _ = _load_providers_raw()
+    if providers:
+        return "liuruyan_models"
+    if (os.getenv("LLM_BASE_URL") or "").strip():
+        return "env"
+    return "unconfigured"
+
+
 def current_model() -> str:
-    gw = _load_gateway_cfg()
-    if gw and gw.get("default_model"):
-        return gw["default_model"]
-    _, cur = _load_providers_raw()
-    if cur:
-        return cur
+    cat = build_model_catalog()
+    if cat.get("default"):
+        return str(cat["default"])
+    st = settings_store.load_settings()
+    if st.get("default_text_model"):
+        return str(st["default_text_model"]).strip()
     return (os.getenv("LLM_MODEL") or "").strip()
 
 
 def list_text_models() -> List[Dict[str, str]]:
+    st = settings_store.load_settings()
+    custom = _load_custom_cfg()
+    if st.get("mode") == "custom" and custom:
+        out: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for mid in (custom.get("default_model"), custom.get("fast_model")):
+            m = (mid or "").strip()
+            if m and m not in seen:
+                seen.add(m)
+                out.append({"model": m, "name": m, "provider": "custom", "provider_name": "自定义 API"})
+        return out
+
     gw = _load_gateway_cfg()
     if gw:
         ms = _gateway_models(gw)
         if ms:
             return ms
+
     providers, _ = _load_providers_raw()
-    out: List[Dict[str, str]] = []
+    out = []
+    seen = set()
+    if custom:
+        for mid in (custom.get("default_model"), custom.get("fast_model")):
+            m = (mid or "").strip()
+            if m and m not in seen:
+                seen.add(m)
+                out.append({"model": m, "name": m, "provider": "custom", "provider_name": "自定义 API"})
+
     for pid, pdata in providers.items():
         if not pdata.get("enabled", True):
             continue
@@ -123,8 +190,9 @@ def list_text_models() -> List[Dict[str, str]]:
             mid = m.get("id") if isinstance(m, dict) else str(m)
             mname = (m.get("name") if isinstance(m, dict) else "") or mid
             tags = (m.get("tags") if isinstance(m, dict) else []) or []
-            if not mid or "image_gen" in tags:
+            if not mid or "image_gen" in tags or mid in seen:
                 continue
+            seen.add(mid)
             out.append({
                 "model": mid,
                 "name": mname,
@@ -138,8 +206,14 @@ def list_text_models() -> List[Dict[str, str]]:
 
 
 def list_image_models() -> List[Dict[str, str]]:
-    providers, _ = _load_providers_raw()
+    st = settings_store.load_settings()
     out: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    custom_img = str(st.get("default_image_model") or "").strip()
+    if custom_img and (st.get("image_base_url") or (st.get("mode") == "custom" and st.get("llm_base_url"))):
+        seen.add(custom_img)
+        out.append({"model": custom_img, "provider": "custom_image", "provider_name": "自定义生图"})
+    providers, _ = _load_providers_raw()
     for pid, pdata in providers.items():
         if not pdata.get("enabled", True):
             continue
@@ -147,15 +221,32 @@ def list_image_models() -> List[Dict[str, str]]:
         for m in pdata.get("models") or []:
             mid = m.get("id") if isinstance(m, dict) else str(m)
             tags = (m.get("tags") if isinstance(m, dict) else []) or []
-            if mid and "image_gen" in tags:
+            if mid and "image_gen" in tags and mid not in seen:
+                seen.add(mid)
                 out.append({"model": mid, "provider": pid, "provider_name": pname})
     return out
 
 
 def build_model_catalog(selected_model: str = "") -> Dict[str, Any]:
+    st = settings_store.load_settings()
+    custom = _load_custom_cfg()
+    if st.get("mode") == "custom" and custom:
+        models: Dict[str, Any] = {}
+        for mid in (selected_model, custom.get("default_model"), custom.get("fast_model")):
+            m = (mid or "").strip()
+            if m:
+                models[m] = {
+                    "base_url": custom["base_url"],
+                    "api_key": custom["api_key"],
+                    "transport": "openai_chat",
+                    "provider": "custom",
+                }
+        default = (selected_model or "").strip() or custom.get("default_model") or custom.get("fast_model") or ""
+        return {"default": default, "models": models}
+
     gw = _load_gateway_cfg()
     if gw:
-        models: Dict[str, Any] = {}
+        models = {}
         for item in _gateway_models(gw):
             models[item["model"]] = {
                 "base_url": gw["base_url"],
@@ -163,7 +254,7 @@ def build_model_catalog(selected_model: str = "") -> Dict[str, Any]:
                 "transport": "openai_chat",
                 "provider": "gateway",
             }
-        default = (selected_model or "").strip() or gw.get("default_model") or ""
+        default = (selected_model or "").strip() or st.get("default_text_model") or gw.get("default_model") or ""
         if default and default not in models:
             models[default] = {
                 "base_url": gw["base_url"],
@@ -177,6 +268,17 @@ def build_model_catalog(selected_model: str = "") -> Dict[str, Any]:
 
     providers, cur = _load_providers_raw()
     models = {}
+    if custom:
+        for mid in (custom.get("default_model"), custom.get("fast_model")):
+            m = (mid or "").strip()
+            if m:
+                models[m] = {
+                    "base_url": custom["base_url"],
+                    "api_key": custom["api_key"],
+                    "transport": "openai_chat",
+                    "provider": "custom",
+                }
+
     for pid, pdata in providers.items():
         if not pdata.get("enabled", True):
             continue
@@ -189,7 +291,7 @@ def build_model_catalog(selected_model: str = "") -> Dict[str, Any]:
         for m in pdata.get("models") or []:
             mid = m.get("id") if isinstance(m, dict) else str(m)
             tags = (m.get("tags") if isinstance(m, dict) else []) or []
-            if not mid or "image_gen" in tags:
+            if not mid or "image_gen" in tags or mid in models:
                 continue
             models[mid] = {
                 "base_url": base_url,
@@ -197,7 +299,148 @@ def build_model_catalog(selected_model: str = "") -> Dict[str, Any]:
                 "transport": "openai_chat",
                 "provider": pid,
             }
-    default = (selected_model or "").strip() or cur or (os.getenv("LLM_MODEL") or "").strip()
+    default = (
+        (selected_model or "").strip()
+        or str(st.get("default_text_model") or "").strip()
+        or cur
+        or (os.getenv("LLM_MODEL") or "").strip()
+    )
     if default not in models and models:
         default = next(iter(models))
     return {"default": default, "models": models}
+
+
+def _single_chat_request(
+    base_url: str,
+    api_key: str,
+    target_model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout: int,
+) -> str:
+    url = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    payload = {
+        "model": target_model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    r = httpx.post(url, headers=headers, json=payload, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    msg = choices[0].get("message") or {}
+    return str(msg.get("content") or "").strip()
+
+
+def chat_completion_with_meta(
+    messages: List[Dict[str, str]],
+    model: str = "",
+    temperature: float = 0.4,
+    max_tokens: int = 2400,
+    timeout: int = 60,
+    prefer_fast: bool = False,
+) -> Tuple[str, str]:
+    """发起同步对话请求并返回 (reply_text, actual_model_used)。"""
+    st = settings_store.load_settings()
+    cat = build_model_catalog(model)
+    models_map = cat.get("models") or {}
+    target_model = (model or cat.get("default") or "").strip()
+
+    candidates: List[Tuple[str, Dict[str, Any]]] = []
+    seen_ids: set[str] = set()
+
+    def _add_cand(mid: str, cfg: Dict[str, Any]) -> None:
+        if mid and mid not in seen_ids and cfg.get("base_url"):
+            seen_ids.add(mid)
+            candidates.append((mid, cfg))
+
+    if prefer_fast and not model:
+        user_fast = str(st.get("fast_text_model") or "").strip()
+        if user_fast and user_fast in models_map:
+            _add_cand(user_fast, models_map[user_fast])
+
+    fast_ids = (
+        "deepseek-v4.1-flash",
+        "deepseek-flash",
+        "deepseek-v4-flash",
+        "deepseek/deepseek-v4-flash-free",
+        "qwen3.8-max",
+        "gpt-5.6-sol",
+        "grok-4.5",
+        "glm-5.3-flash",
+    )
+    if prefer_fast and not model and st.get("mode") != "custom":
+        for fid in fast_ids:
+            if fid in models_map and models_map[fid].get("api_key"):
+                _add_cand(fid, models_map[fid])
+                if len(candidates) >= 2:
+                    break
+
+    if target_model and target_model in models_map:
+        _add_cand(target_model, models_map[target_model])
+    elif not models_map:
+        env_url = (os.getenv("LLM_BASE_URL") or "").strip().rstrip("/")
+        env_key = (os.getenv("LLM_API_KEY") or "").strip()
+        if env_url:
+            _add_cand(target_model or (os.getenv("LLM_MODEL") or "deepseek-chat").strip(), {"base_url": env_url, "api_key": env_key})
+
+    if not model and st.get("mode") != "custom":
+        for fid in fast_ids:
+            if fid in models_map and models_map[fid].get("api_key"):
+                _add_cand(fid, models_map[fid])
+                if len(candidates) >= 4:
+                    break
+
+    if not candidates:
+        raise RuntimeError("未配置可用的文本模型或 Gateway")
+
+    last_err: Optional[Exception] = None
+    for mid, cfg in candidates[:4]:
+        base_url = str(cfg.get("base_url") or "").rstrip("/")
+        if not base_url:
+            continue
+        try:
+            text = _single_chat_request(
+                base_url,
+                str(cfg.get("api_key") or ""),
+                mid,
+                messages,
+                temperature,
+                max_tokens,
+                timeout,
+            )
+            if text:
+                return text, mid
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    return "", candidates[0][0]
+
+
+def chat_completion(
+    messages: List[Dict[str, str]],
+    model: str = "",
+    temperature: float = 0.4,
+    max_tokens: int = 2400,
+    timeout: int = 60,
+    prefer_fast: bool = False,
+) -> str:
+    """使用当前解析到的模型目录发起一次同步 OpenAI 兼容对话请求（支持快模型优先与兜底）。"""
+    text, _ = chat_completion_with_meta(
+        messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        prefer_fast=prefer_fast,
+    )
+    return text

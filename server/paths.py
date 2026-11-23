@@ -101,6 +101,14 @@ def gateway_config_path() -> Path:
     return data_dir() / "gateway.json"
 
 
+def settings_config_path() -> Path:
+    return data_dir() / "settings.json"
+
+
+def db_path() -> Path:
+    return data_dir() / "aicontent.db"
+
+
 def models_config_paths() -> list[tuple[Path, Optional[Path]]]:
     """返回候选 (models.json, models.secrets.json) 列表，优先 ai-content 自有配置，再回退柳如烟配置。"""
     out: list[tuple[Path, Optional[Path]]] = []
@@ -121,6 +129,16 @@ def find_tavily_api_key() -> str:
     env_key = (os.getenv("AICONTENT_TAVILY_KEY") or os.getenv("TAVILY_API_KEY") or "").strip()
     if env_key:
         return env_key
+    sp = settings_config_path()
+    if sp.exists():
+        try:
+            import json
+            sc = json.loads(sp.read_text(encoding="utf-8-sig"))
+            k = str(sc.get("tavily_api_key") or "").strip()
+            if k:
+                return k
+        except Exception:
+            pass
     for base in [data_dir(), liuruyan_data_dir()]:
         if not base:
             continue

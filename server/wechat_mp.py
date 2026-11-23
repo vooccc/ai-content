@@ -19,10 +19,12 @@ import requests
 from .paths import wechat_mp_config_path
 
 _API = "https://api.weixin.qq.com/cgi-bin"
+_DATACUBE_API = "https://api.weixin.qq.com/datacube"
 
 _TOKEN_CACHE: dict = {}
 _TOKEN_LOCK = threading.Lock()
 _THUMB_CACHE: dict = {}
+_ARTICLE_IMG_CACHE: dict = {}
 
 _ERR_HINTS = {
     40001: "AppSecret 错误或 access_token 失效（检查 wechat_mp.json 里的 secret）",
@@ -182,6 +184,101 @@ def _resolve_thumb(thumb_media_id: Optional[str], cfg: dict,
         "公众号图文草稿必须有封面图：请在 wechat_mp.json 配 default_thumb_media_id，"
         "或配 default_thumb_path（本地图片，会自动上传成素材），或在请求里传 thumb_media_id"
     )
+
+
+def _read_image_bytes(src: str) -> tuple[bytes, str]:
+    """读取图片字节与扩展名，支持本地路径、data:image/...;base64、http(s) URL。"""
+    s = (src or "").strip()
+    if not s:
+        raise WeChatError("图片地址为空")
+    if s.startswith("data:"):
+        try:
+            header, b64 = s.split(",", 1)
+            raw = base64.b64decode(b64)
+            ext = ".jpg" if ("jpeg" in header or "jpg" in header) else (".gif" if "gif" in header else ".png")
+            return raw, ext
+        except Exception as e:
+            raise WeChatError(f"解析 data 图片失败：{e}")
+    if s.startswith("http://") or s.startswith("https://"):
+        try:
+            r = requests.get(s, timeout=25)
+            r.raise_for_status()
+            raw = r.content
+        except Exception as e:
+            raise WeChatError(f"下载外链图片失败：{e}")
+        ext = os.path.splitext(s.split("?")[0])[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            ext = ".jpg"
+        return raw, ext
+    p = Path(s)
+    if not p.exists() or not p.is_file():
+        raise WeChatError(f"本地图片不存在：{s}")
+    ext = p.suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+        ext = ".png"
+    return p.read_bytes(), ext
+
+
+def upload_article_image(src: str, appid: str = "", secret: str = "") -> str:
+    """上传正文插图到微信图床（/cgi-bin/media/uploadimg），返回永久 mmbiz URL。"""
+    s = (src or "").strip()
+    if not s:
+        raise WeChatError("正文图片地址为空")
+    if "mmbiz.qpic.cn" in s or "mmbiz.qlogo.cn" in s:
+        return s
+    raw, ext = _read_image_bytes(s)
+    key = f"{appid}:img:{hashlib.sha256(raw).hexdigest()[:20]}"
+    if key in _ARTICLE_IMG_CACHE:
+        return _ARTICLE_IMG_CACHE[key]
+    token = get_access_token(appid, secret)
+    fname = f"article_img{ext}"
+    try:
+        r = requests.post(
+            f"{_API}/media/uploadimg",
+            params={"access_token": token},
+            files={"media": (fname, raw)},
+            timeout=30,
+        )
+        data = r.json()
+    except Exception as e:
+        raise WeChatError(f"上传正文图片网络失败：{e}")
+    _check_errcode(data)
+    url = str(data.get("url") or "").strip()
+    if not url:
+        raise WeChatError("上传正文图片失败：微信未返回图片 url")
+    _ARTICLE_IMG_CACHE[key] = url
+    return url
+
+
+def rewrite_html_images_for_wechat(
+    html_content: str,
+    appid: str = "",
+    secret: str = "",
+) -> tuple[str, int, list[str]]:
+    """扫描 HTML 中的 <img src="...">，自动上传至微信图床并替换 src。"""
+    if not html_content or "<img" not in html_content.lower():
+        return html_content, 0, []
+    uploaded = 0
+    warnings: list[str] = []
+    img_src_re = re.compile(r'(<img\b[^>]*?\bsrc\s*=\s*)(["\'])([^"\']+)\2', re.I)
+
+    def _replace(m) -> str:
+        nonlocal uploaded
+        prefix, quote, orig_src = m.group(1), m.group(2), m.group(3).strip()
+        if not orig_src or "mmbiz.qpic.cn" in orig_src or "mmbiz.qlogo.cn" in orig_src:
+            return m.group(0)
+        if orig_src == "图片URL":
+            return m.group(0)
+        try:
+            wx_url = upload_article_image(orig_src, appid=appid, secret=secret)
+            uploaded += 1
+            return f"{prefix}{quote}{wx_url}{quote}"
+        except Exception as e:
+            warnings.append(f"{orig_src[:60]}: {e}")
+            return m.group(0)
+
+    rewritten = img_src_re.sub(_replace, html_content)
+    return rewritten, uploaded, warnings
 
 
 def _inline(s: str) -> str:
@@ -372,9 +469,15 @@ def _apply_inline_styles(html: str, tpl: dict) -> str:
     return html
 
 
-def markdown_to_wechat_html(text: str, style: str = "") -> str:
+def markdown_to_wechat_html(text: str, style: str = "", author: str = "", footer: str = "") -> str:
     if not text or not text.strip():
         return "<p></p>"
+    try:
+        from .gzh_themes import THEME_SPECS, render_wechat_theme_html
+        if style in THEME_SPECS:
+            return render_wechat_theme_html(text, theme_id=style, author=author, footer=footer)
+    except Exception:
+        pass
     cleaned = _preprocess_text(text)
     try:
         import markdown as md
@@ -404,7 +507,10 @@ def add_draft(title: str, content: str, author: str = "", digest: str = "",
     if _looks_like_html(content):
         html_content = content.strip()
     else:
-        html_content = markdown_to_wechat_html(content, style=style)
+        html_content = markdown_to_wechat_html(content, style=style, author=author)
+    html_content, uploaded_images, image_warnings = rewrite_html_images_for_wechat(
+        html_content, appid=eff_appid, secret=eff_secret
+    )
     if not digest:
         plain = re.sub(r"<[^>]+>", "", html_content).strip()[:120]
         digest = plain
@@ -433,4 +539,99 @@ def add_draft(title: str, content: str, author: str = "", digest: str = "",
     media_id = data.get("media_id", "")
     if not media_id:
         raise WeChatError("新增草稿失败：未返回 media_id")
-    return {"media_id": media_id}
+    return {
+        "media_id": media_id,
+        "uploaded_images": uploaded_images,
+        "image_warnings": image_warnings,
+    }
+
+
+def _iter_dates(begin_date: str, end_date: str) -> list[str]:
+    from datetime import datetime, timedelta
+    d0 = datetime.strptime(begin_date, "%Y-%m-%d").date()
+    d1 = datetime.strptime(end_date, "%Y-%m-%d").date()
+    if d1 < d0:
+        d0, d1 = d1, d0
+    out: list[str] = []
+    cur = d0
+    while cur <= d1:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
+
+
+def fetch_article_total(begin_date: str, end_date: str,
+                        appid: str = "", secret: str = "") -> list[dict]:
+    """拉取微信官方图文群发总数据（/datacube/getarticletotal）。
+
+    微信限制单次 begin_date == end_date（1 天），这里按天循环拉取并提取每篇文章最新累计表现。
+    """
+    cfg = _load_config()
+    eff_appid = appid or cfg["appid"]
+    eff_secret = secret or cfg["secret"]
+    token = get_access_token(eff_appid, eff_secret)
+    rows: list[dict] = []
+    for day in _iter_dates(begin_date, end_date):
+        try:
+            r = requests.post(
+                f"{_DATACUBE_API}/getarticletotal",
+                params={"access_token": token},
+                json={"begin_date": day, "end_date": day},
+                timeout=15,
+            )
+            data = r.json()
+        except Exception as e:
+            raise WeChatError(f"拉取公众号统计失败（{day}）：{e}")
+        _check_errcode(data)
+        for item in data.get("list") or []:
+            details = item.get("details") or []
+            latest = details[-1] if details else {}
+            rows.append({
+                "ref_date": str(item.get("ref_date") or day),
+                "msgid": str(item.get("msgid") or ""),
+                "title": str(item.get("title") or "").strip(),
+                "target_user": int(latest.get("target_user") or 0),
+                "read_user": int(latest.get("int_page_read_user") or 0),
+                "read_count": int(latest.get("int_page_read_count") or 0),
+                "ori_read_user": int(latest.get("ori_page_read_user") or 0),
+                "share_count": int(latest.get("share_count") or 0),
+                "fav_count": int(latest.get("add_to_fav_count") or 0),
+                "like_count": int(latest.get("like_count") or 0),
+            })
+    return rows
+
+
+def fetch_article_summary(begin_date: str, end_date: str,
+                          appid: str = "", secret: str = "") -> list[dict]:
+    """拉取图文群发每日数据（/datacube/getarticlesummary，单次最多 1 天）。"""
+    cfg = _load_config()
+    eff_appid = appid or cfg["appid"]
+    eff_secret = secret or cfg["secret"]
+    token = get_access_token(eff_appid, eff_secret)
+    rows: list[dict] = []
+    for day in _iter_dates(begin_date, end_date):
+        try:
+            r = requests.post(
+                f"{_DATACUBE_API}/getarticlesummary",
+                params={"access_token": token},
+                json={"begin_date": day, "end_date": day},
+                timeout=15,
+            )
+            data = r.json()
+        except Exception as e:
+            raise WeChatError(f"拉取每日图文数据失败（{day}）：{e}")
+        _check_errcode(data)
+        for item in data.get("list") or []:
+            rows.append({
+                "ref_date": str(item.get("ref_date") or day),
+                "msgid": str(item.get("msgid") or ""),
+                "title": str(item.get("title") or "").strip(),
+                "target_user": int(item.get("target_user") or 0),
+                "read_user": int(item.get("int_page_read_user") or 0),
+                "read_count": int(item.get("int_page_read_count") or 0),
+                "ori_read_user": int(item.get("ori_page_read_user") or 0),
+                "share_count": int(item.get("share_count") or 0),
+                "fav_count": int(item.get("add_to_fav_count") or 0),
+                "like_count": int(item.get("like_count") or 0),
+            })
+    return rows

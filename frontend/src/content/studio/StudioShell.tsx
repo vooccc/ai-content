@@ -4,12 +4,16 @@ import WechatWorkbench from './WechatWorkbench'
 import XhsWorkbench from './XhsWorkbench'
 
 interface NodeMeta { id: string; type: string; role?: string; writes: string }
+export interface ThemeItem { id: string; name: string; desc: string; primary: string }
 export interface Project {
   id: string; title: string; workflow: string; name: string
   inputs: Record<string, string>; nodes: NodeMeta[]
   state: Record<string, unknown>; current: number; done: boolean[]; updated: number
   model?: string
   style?: string
+  theme?: string
+  topic_id?: string
+  account_id?: string
   step_models?: Record<string, string>
 }
 export interface ProjSummary { id: string; title: string; workflow: string; name: string; current: number; total: number; done_count: number; updated: number }
@@ -66,7 +70,12 @@ export const inputStyle: React.CSSProperties = { padding: '7px 10px', borderRadi
 export const goBtn: React.CSSProperties = { padding: '7px 16px', borderRadius: 8, border: 'none', cursor: 'pointer', fontWeight: 600, background: 'linear-gradient(135deg,#c4a77d,#8a6c49)', color: '#fff' }
 export const ghostBtn: React.CSSProperties = { padding: '7px 12px', borderRadius: 8, border: '1px solid rgba(127,127,127,0.35)', cursor: 'pointer', background: 'transparent', color: 'inherit' }
 
-export default function StudioShell() {
+interface StudioShellProps {
+  openProjectId?: string
+  onConsumedOpenProject?: () => void
+}
+
+export default function StudioShell({ openProjectId, onConsumedOpenProject }: StudioShellProps = {}) {
   const [list, setList] = useState<ProjSummary[]>([])
   const [search, setSearch] = useState('')
   const [sortBy, setSortBy] = useState('updated')
@@ -87,6 +96,8 @@ export default function StudioShell() {
   const [txtPick, setTxtPick] = useState('')
   const [styleList, setStyleList] = useState<StyleItem[]>([])
   const [stylePick, setStylePick] = useState('')
+  const [themeList, setThemeList] = useState<ThemeItem[]>([])
+  const [themePick, setThemePick] = useState('moyu_green')
   const [stepModels, setStepModels] = useState<Record<string, string>>({})
   const [editorOpen, setEditorOpen] = useState(false)
   const [edBase, setEdBase] = useState('')
@@ -115,7 +126,14 @@ export default function StudioShell() {
     fetch(`${API_BASE}/studio/image-models`).then((r) => r.json()).then((d) => setImgModels(d.models || [])).catch(() => {})
     fetch(`${API_BASE}/studio/text-models`).then((r) => r.json()).then((d) => { setTxtModels(d.models || []); setCurrentModelId(d.current || '') }).catch(() => {})
     fetch(`${API_BASE}/studio/styles`).then((r) => r.json()).then((d) => setStyleList(d.styles || [])).catch(() => {})
+    fetch(`${API_BASE}/themes`).then((r) => r.json()).then((d) => setThemeList(d.themes || [])).catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (openProjectId) {
+      openProject(openProjectId).finally(() => onConsumedOpenProject?.())
+    }
+  }, [openProjectId])
 
   const defaultModelName = useMemo(() => {
     const m = txtModels.find((x) => x.model === currentModelId)
@@ -154,6 +172,7 @@ export default function StudioShell() {
       setMsg('')
       setTxtPick(d.project.model || '')
       setStylePick(d.project.style || '')
+      setThemePick(d.project.theme || 'moyu_green')
       setStepModels((d.project.step_models as Record<string, string>) || {})
     }
   }
@@ -199,7 +218,7 @@ export default function StudioShell() {
     return result
   }
 
-  async function saveSettings(s: { model?: string; style?: string; step_models?: Record<string, string> }) {
+  async function saveSettings(s: { model?: string; style?: string; theme?: string; step_models?: Record<string, string> }) {
     if (!proj) return
     try {
       await fetch(`${API_BASE}/studio/projects/${proj.id}/settings`, {
@@ -207,6 +226,7 @@ export default function StudioShell() {
         body: JSON.stringify({
           model: s.model !== undefined ? s.model : txtPick,
           style: s.style !== undefined ? s.style : stylePick,
+          theme: s.theme !== undefined ? s.theme : themePick,
           step_models: s.step_models !== undefined ? s.step_models : stepModels,
         }),
       })
@@ -262,7 +282,7 @@ export default function StudioShell() {
 
   if (!proj) {
     return (
-      <div style={{ flex: 1, overflow: 'auto', padding: 18, maxWidth: 900, width: '100%', margin: '0 auto' }}>
+      <div style={{ flex: 1, overflow: 'auto', padding: '18px 24px', width: '100%' }}>
         <div style={{ display: 'flex', alignItems: 'center', marginBottom: 14, gap: 10, flexWrap: 'wrap' }}>
           <button type="button" style={goBtn} onClick={() => setShowNew((v) => !v)}>+ 新建创作</button>
           <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="🔍 搜索标题 / 主题"
@@ -341,7 +361,7 @@ export default function StudioShell() {
     proj, sel, setSel, busy, msg, setMsg,
     imgModels, imgPick, setImgPick, txtModels, txtPick, setTxtPick,
     defaultModelName,
-    styleList, stylePick, setStylePick, stepModels, setStepModels,
+    styleList, stylePick, setStylePick, themeList, themePick, setThemePick, stepModels, setStepModels,
     openProject, runStep, saveSettings, openEditor, loadList,
   }
   return (
@@ -399,11 +419,14 @@ export interface WorkbenchProps {
   styleList: StyleItem[]
   stylePick: string
   setStylePick: (v: string) => void
+  themeList: ThemeItem[]
+  themePick: string
+  setThemePick: (v: string) => void
   stepModels: Record<string, string>
   setStepModels: (m: Record<string, string>) => void
   openProject: (id: string, keepSel?: boolean) => Promise<void>
   runStep: (i: number, opts?: { feedback?: string; nodeModel?: string; onDelta?: (t: string) => void; onReason?: (t: string) => void; onImage?: (ev: { type: string; [k: string]: unknown }) => void }) => Promise<{ ok: boolean; error?: string }>
-  saveSettings: (s: { model?: string; style?: string; step_models?: Record<string, string> }) => Promise<void>
+  saveSettings: (s: { model?: string; style?: string; theme?: string; step_models?: Record<string, string> }) => Promise<void>
   openEditor: () => void
   loadList: () => void
   onBack: () => void

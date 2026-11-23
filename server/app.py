@@ -2,6 +2,7 @@
 """ai-content 独立 FastAPI 服务入口（API + 静态托管 frontend/dist）。"""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -12,9 +13,21 @@ from fastapi.staticfiles import StaticFiles
 from .content_routes import router as content_router
 from .paths import data_dir, project_root
 from .publish_routes import router as publish_router
+from .scheduler import start_scheduler, stop_scheduler
 from .studio_routes import router as studio_router
+from .topic_routes import router as topic_router
 
-app = FastAPI(title="AI Content Studio", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    start_scheduler()
+    try:
+        yield
+    finally:
+        stop_scheduler()
+
+
+app = FastAPI(title="AI Content Studio", version="0.1.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +40,7 @@ app.add_middleware(
 app.include_router(content_router)
 app.include_router(studio_router)
 app.include_router(publish_router)
+app.include_router(topic_router)
 
 
 @app.get("/health")
@@ -45,14 +59,14 @@ if _FRONTEND_DIST.is_dir():
 
     @app.get("/")
     def serve_index():
-        return FileResponse(_FRONTEND_DIST / "index.html")
+        return FileResponse(_FRONTEND_DIST / "index.html", headers={"Cache-Control": "no-store"})
 
     @app.get("/{full_path:path}")
     def serve_spa(full_path: str):
         candidate = _FRONTEND_DIST / full_path
         if full_path and candidate.is_file():
             return FileResponse(candidate)
-        return FileResponse(_FRONTEND_DIST / "index.html")
+        return FileResponse(_FRONTEND_DIST / "index.html", headers={"Cache-Control": "no-store"})
 else:
     @app.get("/")
     def no_dist():

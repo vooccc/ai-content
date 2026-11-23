@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import image_gen, llm_bridge, search_gather
+from . import db, gzh_themes, image_gen, llm_bridge, search_gather, settings_store
 from .paths import project_root, studio_dir
 from .wechat_search import search_wechat
 from .xhs.pipeline import regen_single_page, run_image_batch_step
@@ -138,6 +138,20 @@ async def new_project(req: NewProjectRequest):
         return JSONResponse({"ok": False, "error": res.get("msg", "初始化失败")}, status_code=400)
     pid = uuid.uuid4().hex[:12]
     title = req.title.strip() or (req.inputs.get("topic") or res.get("name", "新创作"))
+    acc = db.get_primary_account() if req.workflow == "content_pipeline" else None
+    state = res.get("state", {})
+    if acc:
+        state.setdefault("data", {})
+        if not (state["data"].get("material") or "").strip():
+            banned = "、".join(acc.get("banned_words") or [])
+            guide = (
+                f"【账号定位】{acc.get('niche')}\n"
+                f"【目标读者】{acc.get('audience')}\n"
+                + (f"【禁用词（严格避开 AI 套话）】{banned}\n" if banned else "")
+                + (f"【文末互动引导】{acc.get('footer_template')}" if acc.get("footer_template") else "")
+            ).strip()
+            if guide:
+                state["data"]["material"] = guide
     proj = {
         "id": pid,
         "title": title[:60],
@@ -145,7 +159,10 @@ async def new_project(req: NewProjectRequest):
         "name": res.get("name", ""),
         "inputs": req.inputs,
         "nodes": res.get("nodes", []),
-        "state": res.get("state", {}),
+        "state": state,
+        "style": (acc.get("default_style") if acc else "") or "",
+        "theme": (acc.get("default_theme") if acc else "") or "moyu_green",
+        "account_id": acc["id"] if acc else "",
         "current": 0,
         "done": [False] * len(res.get("nodes", [])),
         "created": time.time(),
@@ -195,6 +212,7 @@ def rename_project(pid: str, req: RenameRequest):
 class StudioSettingsRequest(BaseModel):
     model: str = ""
     style: str = ""
+    theme: str = ""
     step_models: dict = {}
 
 
@@ -205,9 +223,56 @@ def update_studio_settings(pid: str, req: StudioSettingsRequest):
         return JSONResponse({"ok": False, "error": "项目不存在"}, status_code=404)
     proj["model"] = req.model.strip()
     proj["style"] = req.style.strip()
+    if req.theme.strip():
+        proj["theme"] = req.theme.strip()
     proj["step_models"] = req.step_models or {}
     _save(proj)
     return {"ok": True}
+
+
+class RenderThemeRequest(BaseModel):
+    theme: str = "moyu_green"
+    author: str = ""
+    include_footer: bool = True
+
+
+@router.post("/studio/projects/{pid}/render-theme")
+def render_project_theme(pid: str, req: RenderThemeRequest):
+    """秒级切换公众号排版主题并更新 state.layout.html（无需重跑 LLM）。"""
+    proj = _load(pid)
+    if proj is None:
+        return JSONResponse({"ok": False, "error": "项目不存在"}, status_code=404)
+    st = proj.setdefault("state", {})
+    md_text = str(st.get("final") or st.get("styled") or st.get("draft") or "").strip()
+    if not md_text:
+        return JSONResponse({"ok": False, "error": "暂无可排版正文，请先完成撰稿/定稿步"}, status_code=400)
+    theme_id = req.theme.strip() or proj.get("theme") or "moyu_green"
+    acc = db.get_primary_account()
+    footer = acc.get("footer_template", "") if req.include_footer else ""
+    if theme_id in gzh_themes.THEME_SPECS:
+        html_out = gzh_themes.render_wechat_theme_html(md_text, theme_id=theme_id, author=req.author.strip(), footer=footer)
+    else:
+        from . import wechat_mp
+        html_out = wechat_mp.markdown_to_wechat_html(md_text, style=theme_id, author=req.author.strip(), footer=footer)
+    layout = st.get("layout") if isinstance(st.get("layout"), dict) else {}
+    layout = dict(layout)
+    layout["html"] = html_out
+    layout["markdown"] = md_text
+    layout["theme"] = theme_id
+    st["layout"] = layout
+    proj["theme"] = theme_id
+    nodes = proj.get("nodes") or []
+    for idx, nd in enumerate(nodes):
+        if nd.get("id") == "format" or nd.get("tool") == "content.format":
+            done = proj.get("done") or [False] * len(nodes)
+            if idx < len(done):
+                done[idx] = True
+            proj["done"] = done
+            if proj.get("current", 0) <= idx:
+                proj["current"] = idx + 1
+            break
+    _save(proj)
+    return {"ok": True, "theme": theme_id, "html": html_out, "layout": layout}
 
 
 class ImportLocalRequest(BaseModel):
@@ -389,15 +454,22 @@ async def run_step(pid: str, req: StepRequest):
             if _st.get("_cover_model"):
                 pick = f"{_st['_cover_model']}|{_st.get('_cover_provider', '')}"
         if not pick:
+            pick = str(settings_store.load_settings().get("default_image_model") or "").strip()
+        if not pick:
             return JSONResponse({"ok": False,
-                "error": "请先在右侧选择一个配图模型再生成图组（自动检测已禁用——配置里可能混有失效 key）"},
+                "error": "请先在右侧选择一个配图模型（或在「账号与设置」配置默认生图模型）"},
                 status_code=400)
         _m, _p = ((pick.split("|", 1) + [""])[:2]) if pick else ("", "")
         return await run_image_batch_step(proj, node, index, _m, _p, _save, _mark_done, _sse)
 
+    state_payload = dict(proj.get("state") or {})
+    if proj.get("theme"):
+        state_payload["_theme"] = proj["theme"]
+    if proj.get("style"):
+        state_payload["_style"] = proj["style"]
     fd, tmp = tempfile.mkstemp(suffix=".json", prefix="studio_state_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(proj.get("state", {}), f, ensure_ascii=False)
+        json.dump(state_payload, f, ensure_ascii=False)
 
     async def gen_agent():
         env = dict(os.environ)
@@ -529,12 +601,13 @@ async def gen_cover(pid: str, req: CoverRequest):
         return JSONResponse({"ok": False, "error": "项目不存在"}, status_code=404)
     if not req.prompt.strip():
         return JSONResponse({"ok": False, "error": "配图提示词为空"}, status_code=400)
+    eff_img_model = req.model.strip() or str(settings_store.load_settings().get("default_image_model") or "").strip()
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
         None,
         lambda: image_gen.generate_image(
             prompt=req.prompt.strip(),
-            model=req.model.strip(),
+            model=eff_img_model,
             provider_selector=req.provider.strip(),
             size=req.size,
         ),

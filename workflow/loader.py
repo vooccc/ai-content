@@ -572,17 +572,26 @@ def content_format(state: dict) -> dict:
                 "metadata": {}, "error": "终稿为空"}
 
     cleaned = _preprocess_article(article)
-    html_body = _md_to_html(cleaned)
-    tpl = _WECHAT_STYLE_TEMPLATES.get(style_name) or _WECHAT_STYLE_TEMPLATES["default"]
-    html_body = _apply_inline_styles(html_body, tpl)
+    theme_id = str(state.get("_theme") or "").strip() or style_name
+    html_out = ""
+    try:
+        from server.gzh_themes import THEME_SPECS, render_wechat_theme_html
+        if theme_id in THEME_SPECS:
+            html_out = render_wechat_theme_html(cleaned, theme_id=theme_id)
+    except Exception:
+        html_out = ""
+    if not html_out:
+        html_body = _md_to_html(cleaned)
+        tpl = _WECHAT_STYLE_TEMPLATES.get(style_name) or _WECHAT_STYLE_TEMPLATES["default"]
+        html_body = _apply_inline_styles(html_body, tpl)
 
-    container_style = (
-        "max-width:677px;margin:0 auto;padding:20px 8px;"
-        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',"
-        "'Hiragino Sans GB','Microsoft YaHei',sans-serif;"
-        "font-size:16px;color:#3f3f3f;word-wrap:break-word;"
-    )
-    html_out = f'<section style="{container_style}">\n{html_body}\n</section>'
+        container_style = (
+            "max-width:677px;margin:0 auto;padding:20px 8px;"
+            "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',"
+            "'Hiragino Sans GB','Microsoft YaHei',sans-serif;"
+            "font-size:16px;color:#3f3f3f;word-wrap:break-word;"
+        )
+        html_out = f'<section style="{container_style}">\n{html_body}\n</section>'
 
     metadata = _extract_metadata(cleaned, platform)
 
@@ -642,7 +651,7 @@ def resolve_role_prompt(role: str, style: str = "") -> str:
     base = os.path.join(_PROMPTS_DIR, f"{role}.md")
     if os.path.isfile(base):
         try:
-            with open(styled, "r", encoding="utf-8") as f:
+            with open(base, "r", encoding="utf-8") as f:
                 return f.read().strip()
         except Exception:  # noqa: BLE001
             pass

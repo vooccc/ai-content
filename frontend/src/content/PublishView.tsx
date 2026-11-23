@@ -25,10 +25,74 @@ function openExternal(url: string) {
   window.open(url, '_blank', 'noopener,noreferrer')
 }
 
+interface PrimaryAccount {
+  id: string
+  name: string
+  niche: string
+  audience: string
+  cadence: string
+  title_formulas: string[]
+  banned_words: string[]
+  default_style: string
+  default_theme: string
+  wechat_account_id: string
+  footer_template: string
+  sources_config: {
+    github_trending?: boolean
+    hackernews?: boolean
+    bilibili?: boolean
+    bilibili_accounts?: string[]
+    weibo_hot?: boolean
+    wechat_keywords?: string[]
+    rss_feeds?: { name: string; url: string }[]
+    daily_fetch_enabled?: boolean
+    daily_fetch_time?: string
+    daily_metrics_sync_enabled?: boolean
+    daily_metrics_sync_time?: string
+  }
+}
+
 export default function PublishView() {
   const [platforms, setPlatforms] = useState<Platform[]>([])
   const [loaded, setLoaded] = useState(false)
   const [msg, setMsg] = useState('')
+  const [primaryAcc, setPrimaryAcc] = useState<PrimaryAccount | null>(null)
+  const [accOpen, setAccOpen] = useState(false)
+  const [niche, setNiche] = useState('')
+  const [audience, setAudience] = useState('')
+  const [bannedText, setBannedText] = useState('')
+  const [footerTpl, setFooterTpl] = useState('')
+  const [wxKeywords, setWxKeywords] = useState('')
+  const [rssText, setRssText] = useState('')
+  const [ghEnabled, setGhEnabled] = useState(true)
+  const [hnEnabled, setHnEnabled] = useState(true)
+  const [biliEnabled, setBiliEnabled] = useState(true)
+  const [weiboEnabled, setWeiboEnabled] = useState(true)
+  const [biliAccounts, setBiliAccounts] = useState('')
+  const [dailyFetch, setDailyFetch] = useState(true)
+  const [fetchTime, setFetchTime] = useState('08:00')
+  const [boundWxId, setBoundWxId] = useState('')
+  const [modelOpen, setModelOpen] = useState(false)
+  const [cfgMode, setCfgMode] = useState<'auto' | 'gateway' | 'custom'>('auto')
+  const [activeSource, setActiveSource] = useState('')
+  const [currentModel, setCurrentModel] = useState('')
+  const [textModelOpts, setTextModelOpts] = useState<{ model: string; name: string; provider_name: string }[]>([])
+  const [imageModelOpts, setImageModelOpts] = useState<{ model: string; provider_name: string }[]>([])
+  const [gwUrl, setGwUrl] = useState('http://127.0.0.1:8000/gateway/v1')
+  const [gwToken, setGwToken] = useState('')
+  const [gwTokenHint, setGwTokenHint] = useState('')
+  const [llmBaseUrl, setLlmBaseUrl] = useState('')
+  const [llmApiKey, setLlmApiKey] = useState('')
+  const [llmKeyHint, setLlmKeyHint] = useState('')
+  const [defTextModel, setDefTextModel] = useState('')
+  const [fastTextModel, setFastTextModel] = useState('')
+  const [imgBaseUrl, setImgBaseUrl] = useState('')
+  const [imgApiKey, setImgApiKey] = useState('')
+  const [imgKeyHint, setImgKeyHint] = useState('')
+  const [defImgModel, setDefImgModel] = useState('')
+  const [tavilyKey, setTavilyKey] = useState('')
+  const [tavilyHint, setTavilyHint] = useState('')
+  const [testingModel, setTestingModel] = useState(false)
   const [addingTo, setAddingTo] = useState<string | null>(null)
   const [accName, setAccName] = useState('')
   const [accUrl, setAccUrl] = useState('')
@@ -49,7 +113,165 @@ export default function PublishView() {
       .then((r) => r.json())
       .then((d) => { setPlatforms(d.platforms || []); setLoaded(true) })
       .catch(() => setLoaded(true))
+    fetch(`${API_BASE}/accounts/primary`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.ok && d.account) {
+          const a: PrimaryAccount = d.account
+          setPrimaryAcc(a)
+          setNiche(a.niche || '')
+          setAudience(a.audience || '')
+          setBannedText((a.banned_words || []).join('、'))
+          setFooterTpl(a.footer_template || '')
+          setBoundWxId(a.wechat_account_id || '')
+          const sc = a.sources_config || {}
+          setGhEnabled(sc.github_trending !== false)
+          setHnEnabled(sc.hackernews !== false)
+          setBiliEnabled(sc.bilibili !== false)
+          setWeiboEnabled(sc.weibo_hot !== false)
+          setBiliAccounts((sc.bilibili_accounts || []).join(', '))
+          setWxKeywords((sc.wechat_keywords || []).join(', '))
+          setRssText((sc.rss_feeds || []).map((f) => `${f.name} | ${f.url}`).join('\n'))
+          setDailyFetch(sc.daily_fetch_enabled !== false)
+          setFetchTime(sc.daily_fetch_time || '08:00')
+        }
+      })
+      .catch(() => {})
+    loadModelSettings()
   }, [])
+
+  function applyModelPayload(d: {
+    settings?: Record<string, unknown>
+    active_source?: string
+    current_model?: string
+    text_models?: { model: string; name: string; provider_name: string }[]
+    image_models?: { model: string; provider_name: string }[]
+  }) {
+    const s = d.settings || {}
+    setCfgMode(((s.mode as string) || 'auto') as 'auto' | 'gateway' | 'custom')
+    setGwUrl(String(s.gateway_url || 'http://127.0.0.1:8000/gateway/v1'))
+    setGwTokenHint(String(s.gateway_token_masked || ''))
+    setLlmBaseUrl(String(s.llm_base_url || ''))
+    setLlmKeyHint(String(s.llm_api_key_masked || ''))
+    setDefTextModel(String(s.default_text_model || ''))
+    setFastTextModel(String(s.fast_text_model || ''))
+    setImgBaseUrl(String(s.image_base_url || ''))
+    setImgKeyHint(String(s.image_api_key_masked || ''))
+    setDefImgModel(String(s.default_image_model || ''))
+    setTavilyHint(String(s.tavily_api_key_masked || ''))
+    setActiveSource(d.active_source || '')
+    setCurrentModel(d.current_model || '')
+    setTextModelOpts(d.text_models || [])
+    setImageModelOpts(d.image_models || [])
+  }
+
+  async function loadModelSettings() {
+    try {
+      const res = await fetch(`${API_BASE}/settings/models`)
+      const d = await res.json()
+      if (d.ok) applyModelPayload(d)
+    } catch { /* 静默 */ }
+  }
+
+  async function saveModelSettings() {
+    try {
+      const body: Record<string, unknown> = {
+        mode: cfgMode,
+        gateway_url: gwUrl.trim(),
+        llm_base_url: llmBaseUrl.trim(),
+        default_text_model: defTextModel.trim(),
+        fast_text_model: fastTextModel.trim(),
+        image_base_url: imgBaseUrl.trim(),
+        default_image_model: defImgModel.trim(),
+      }
+      if (gwToken.trim()) body.gateway_token = gwToken.trim()
+      if (llmApiKey.trim()) body.llm_api_key = llmApiKey.trim()
+      if (imgApiKey.trim()) body.image_api_key = imgApiKey.trim()
+      if (tavilyKey.trim()) body.tavily_api_key = tavilyKey.trim()
+      const res = await fetch(`${API_BASE}/settings/models`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const d = await res.json()
+      if (d.ok) {
+        applyModelPayload(d)
+        setGwToken(''); setLlmApiKey(''); setImgApiKey(''); setTavilyKey('')
+        setMsg('✓ 已保存模型与连接配置')
+        setTimeout(() => setMsg(''), 2200)
+      }
+    } catch (e) {
+      setMsg(`✗ 保存模型配置失败：${e}`)
+    }
+  }
+
+  async function testModelConn() {
+    if (testingModel) return
+    setTestingModel(true)
+    setMsg('正在测试模型连通性…')
+    try {
+      const res = await fetch(`${API_BASE}/settings/models/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: defTextModel.trim(), prefer_fast: !defTextModel.trim() }),
+      })
+      const d = await res.json()
+      if (res.ok && d.ok) {
+        setMsg(`✓ 连通成功：${d.model}（${d.latency_ms}ms，回复：${d.reply}）`)
+      } else {
+        setMsg(`✗ ${d.error || `HTTP ${res.status}`}`)
+      }
+    } catch (e) {
+      setMsg(`✗ 测试失败：${e}`)
+    } finally {
+      setTestingModel(false)
+    }
+  }
+
+  async function savePrimaryAccount() {
+    if (!primaryAcc) return
+    const banned_words = bannedText.split(/[,，、\n]/).map((s) => s.trim()).filter(Boolean)
+    const wechat_keywords = wxKeywords.split(/[,，、\n]/).map((s) => s.trim()).filter(Boolean)
+    const bilibili_accounts = biliAccounts.split(/[,，、\n]/).map((s) => s.trim()).filter(Boolean)
+    const rss_feeds = rssText.split('\n').map((ln) => ln.trim()).filter(Boolean).map((ln) => {
+      const parts = ln.split('|').map((s) => s.trim())
+      return parts.length >= 2 ? { name: parts[0], url: parts[1] } : { name: parts[0], url: parts[0] }
+    })
+    try {
+      const res = await fetch(`${API_BASE}/accounts/primary`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          niche: niche.trim(),
+          audience: audience.trim(),
+          banned_words,
+          footer_template: footerTpl.trim(),
+          wechat_account_id: boundWxId,
+          sources_config: {
+            ...(primaryAcc.sources_config || {}),
+            github_trending: ghEnabled,
+            hackernews: hnEnabled,
+            bilibili: biliEnabled,
+            weibo_hot: weiboEnabled,
+            bilibili_accounts,
+            wechat_keywords,
+            rss_feeds,
+            daily_fetch_enabled: dailyFetch,
+            daily_fetch_time: fetchTime || '08:00',
+          },
+        }),
+      })
+      const d = await res.json()
+      if (d.ok) {
+        setPrimaryAcc(d.account)
+        setAccOpen(false)
+        setMsg('✓ 已保存主号定位与抓取配置')
+        setTimeout(() => setMsg(''), 2200)
+      }
+    } catch (e) {
+      setMsg(`保存失败：${e}`)
+    }
+  }
 
   async function save(next: Platform[], tip?: string) {
     setPlatforms(next)
@@ -231,10 +453,169 @@ export default function PublishView() {
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, height: '100%' }}>
       <input ref={fileRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={onThumbPicked} />
 
-      <div style={{ flex: 1, overflow: 'auto', padding: 18, maxWidth: 920, width: '100%', margin: '0 auto' }}>
+      <div style={{ flex: 1, overflow: 'auto', padding: '18px 24px', width: '100%' }}>
         {msg && (
           <div style={{ ...card, borderColor: 'rgba(196,167,125,0.6)', background: 'rgba(196,167,125,0.12)', fontSize: 13 }}>
             {msg}
+          </div>
+        )}
+
+        <div style={{ ...card, borderColor: 'rgba(196,167,125,0.4)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{ fontWeight: 600, fontSize: 15 }}>🤖 模型与连接配置</span>
+            <span style={{ fontSize: 12, opacity: 0.7 }}>
+              {activeSource === 'gateway' ? '柳如烟 Gateway'
+                : activeSource === 'custom' ? '独立自定义 API'
+                : activeSource === 'liuruyan_models' ? '自动复用柳如烟模型'
+                : activeSource === 'env' ? '环境变量'
+                : '未配置'}
+            </span>
+            {currentModel && (
+              <span style={{ fontSize: 12, opacity: 0.55 }}>· 默认：{currentModel}</span>
+            )}
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+              <button type="button" style={ghostBtn} disabled={testingModel} onClick={testModelConn}>
+                {testingModel ? '测试中…' : '⚡ 测试连通'}
+              </button>
+              <button type="button" style={ghostBtn} onClick={() => setModelOpen((v) => !v)}>
+                {modelOpen ? '收起' : '配置模型'}
+              </button>
+            </div>
+          </div>
+          {modelOpen && (
+            <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid rgba(127,127,127,0.15)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', fontSize: 13 }}>
+                <span style={{ opacity: 0.7 }}>接入模式：</span>
+                {([
+                  ['auto', '自动（优先自定义，回退柳如烟）'],
+                  ['gateway', '柳如烟 Gateway'],
+                  ['custom', '独立自定义 API'],
+                ] as const).map(([m, label]) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setCfgMode(m)}
+                    style={{
+                      ...ghostBtn,
+                      padding: '4px 10px',
+                      fontSize: 12.5,
+                      borderColor: cfgMode === m ? 'rgba(196,167,125,0.9)' : 'rgba(127,127,127,0.3)',
+                      background: cfgMode === m ? 'rgba(196,167,125,0.16)' : 'transparent',
+                    }}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              {cfgMode === 'gateway' && (
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <input value={gwUrl} onChange={(e) => setGwUrl(e.target.value)} placeholder="Gateway URL（如 http://127.0.0.1:8000/gateway/v1）" style={{ ...inputStyle, flex: 2, minWidth: 220 }} />
+                  <input value={gwToken} onChange={(e) => setGwToken(e.target.value)} type="password" placeholder={gwTokenHint ? `Gateway Token（已配：${gwTokenHint}）` : 'Gateway Token'} style={{ ...inputStyle, flex: 1, minWidth: 180 }} />
+                </div>
+              )}
+
+              {cfgMode !== 'gateway' && (
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <input value={llmBaseUrl} onChange={(e) => setLlmBaseUrl(e.target.value)} placeholder="自定义 LLM Base URL（如 https://api.deepseek.com/v1，留空则复用柳如烟）" style={{ ...inputStyle, flex: 2, minWidth: 240 }} />
+                  <input value={llmApiKey} onChange={(e) => setLlmApiKey(e.target.value)} type="password" placeholder={llmKeyHint ? `API Key（已配：${llmKeyHint}）` : 'API Key（留空则复用柳如烟）'} style={{ ...inputStyle, flex: 1, minWidth: 180 }} />
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <div style={{ flex: 1, minWidth: 200, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <span style={{ fontSize: 12, opacity: 0.7 }}>默认写作模型</span>
+                  <input list="aicontent-text-models" value={defTextModel} onChange={(e) => setDefTextModel(e.target.value)} placeholder="留空自动选择（可下拉选或手填）" style={inputStyle} />
+                </div>
+                <div style={{ flex: 1, minWidth: 200, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <span style={{ fontSize: 12, opacity: 0.7 }}>选题筛选快模型（推荐 flash/非思考模型）</span>
+                  <input list="aicontent-text-models" value={fastTextModel} onChange={(e) => setFastTextModel(e.target.value)} placeholder="如 deepseek-v4.1-flash（留空自动挑快模型）" style={inputStyle} />
+                </div>
+                <div style={{ flex: 1, minWidth: 200, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <span style={{ fontSize: 12, opacity: 0.7 }}>默认生图模型</span>
+                  <input list="aicontent-image-models" value={defImgModel} onChange={(e) => setDefImgModel(e.target.value)} placeholder="留空则按工作台所选" style={inputStyle} />
+                </div>
+              </div>
+
+              <datalist id="aicontent-text-models">
+                {textModelOpts.map((m) => (
+                  <option key={m.model} value={m.model}>{m.provider_name} · {m.name}</option>
+                ))}
+              </datalist>
+              <datalist id="aicontent-image-models">
+                {imageModelOpts.map((m) => (
+                  <option key={m.model} value={m.model}>{m.provider_name}</option>
+                ))}
+              </datalist>
+
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <input value={imgBaseUrl} onChange={(e) => setImgBaseUrl(e.target.value)} placeholder="独立生图 Base URL（可选，不填则复用上方/柳如烟）" style={{ ...inputStyle, flex: 2, minWidth: 220 }} />
+                <input value={imgApiKey} onChange={(e) => setImgApiKey(e.target.value)} type="password" placeholder={imgKeyHint ? `生图 Key（已配：${imgKeyHint}）` : '生图 API Key（可选）'} style={{ ...inputStyle, flex: 1, minWidth: 160 }} />
+                <input value={tavilyKey} onChange={(e) => setTavilyKey(e.target.value)} type="password" placeholder={tavilyHint ? `Tavily Key（已配：${tavilyHint}）` : 'Tavily 搜索 Key（可选）'} style={{ ...inputStyle, flex: 1, minWidth: 160 }} />
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                <button type="button" style={goBtn} onClick={saveModelSettings}>保存模型配置</button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {primaryAcc && (
+          <div style={{ ...card, borderColor: 'rgba(196,167,125,0.4)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ fontWeight: 600, fontSize: 15 }}>🎯 主号定位与抓取设置</span>
+              <span style={{ fontSize: 12, opacity: 0.7 }}>{primaryAcc.niche}</span>
+              <span style={{ fontSize: 12, opacity: 0.55 }}>
+                · {dailyFetch ? `每日 ${fetchTime} 自动抓选题` : '手动抓取'}
+              </span>
+              <button type="button" style={{ ...ghostBtn, marginLeft: 'auto' }} onClick={() => setAccOpen((v) => !v)}>
+                {accOpen ? '收起' : '编辑定位与抓取源'}
+              </button>
+            </div>
+            {accOpen && (
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid rgba(127,127,127,0.15)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <input value={niche} onChange={(e) => setNiche(e.target.value)} placeholder="赛道定位" style={{ ...inputStyle, flex: 1, minWidth: 220 }} />
+                  <select value={boundWxId} onChange={(e) => setBoundWxId(e.target.value)} style={{ ...inputStyle, minWidth: 180, background: 'var(--bg-card)' }}>
+                    <option value="">默认使用首个公众号凭证</option>
+                    {(platforms.find((p) => p.key === 'wechat_mp')?.accounts || []).map((a) => (
+                      <option key={a.id} value={a.id}>主号：{a.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <input value={audience} onChange={(e) => setAudience(e.target.value)} placeholder="目标读者" style={inputStyle} />
+                <input value={bannedText} onChange={(e) => setBannedText(e.target.value)} placeholder="去 AI 味禁用词（顿号或逗号分隔）" style={inputStyle} />
+                <input value={footerTpl} onChange={(e) => setFooterTpl(e.target.value)} placeholder="文末低门槛互动引导" style={inputStyle} />
+                <input value={wxKeywords} onChange={(e) => setWxKeywords(e.target.value)} placeholder="抓取关键词（逗号分隔，自动扩展中英文变体）" style={inputStyle} />
+                <input value={biliAccounts} onChange={(e) => setBiliAccounts(e.target.value)} placeholder="对标 B站 UP 主（可选，逗号分隔昵称或 UID）" style={inputStyle} />
+                <textarea value={rssText} onChange={(e) => setRssText(e.target.value)} placeholder="RSS 源（每行：名称 | URL）" style={{ ...inputStyle, minHeight: 72, resize: 'vertical', fontSize: 12.5 }} />
+                <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', alignItems: 'center', fontSize: 13 }}>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={ghEnabled} onChange={(e) => setGhEnabled(e.target.checked)} />
+                    GitHub Trending
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={hnEnabled} onChange={(e) => setHnEnabled(e.target.checked)} />
+                    Hacker News
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={biliEnabled} onChange={(e) => setBiliEnabled(e.target.checked)} />
+                    B站视频
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={weiboEnabled} onChange={(e) => setWeiboEnabled(e.target.checked)} />
+                    微博热搜
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={dailyFetch} onChange={(e) => setDailyFetch(e.target.checked)} />
+                    每日自动抓选题
+                  </label>
+                  <input type="time" value={fetchTime} onChange={(e) => setFetchTime(e.target.value)} style={{ ...inputStyle, padding: '4px 8px' }} />
+                  <button type="button" style={{ ...goBtn, marginLeft: 'auto' }} onClick={savePrimaryAccount}>保存设置</button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
