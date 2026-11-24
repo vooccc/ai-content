@@ -40,6 +40,10 @@ export default function MetricsView() {
   const [reviewing, setReviewing] = useState(false)
   const [review, setReview] = useState<ReviewResult | null>(null)
   const [showAdd, setShowAdd] = useState(false)
+  const [showImport, setShowImport] = useState(false)
+  const [importText, setImportText] = useState('')
+  const [importPreview, setImportPreview] = useState<{ count: number; total_reads: number; preview: { ref_date: string; title: string; read_user: number }[] } | null>(null)
+  const [importBusy, setImportBusy] = useState(false)
   const [title, setTitle] = useState('')
   const [refDate, setRefDate] = useState(() => new Date().toISOString().slice(0, 10))
   const [readUser, setReadUser] = useState('')
@@ -110,6 +114,37 @@ export default function MetricsView() {
       }
     } catch (e) {
       setMsg(`✗ 保存失败：${e}`)
+    }
+  }
+
+  async function runImport(dryRun: boolean) {
+    if (!importText.trim()) return
+    setImportBusy(true)
+    setMsg('')
+    try {
+      const res = await fetch(`${API_BASE}/metrics/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: importText, dry_run: dryRun }),
+      })
+      const d = await res.json()
+      if (!res.ok || !d.ok) {
+        setMsg(`✗ ${d.error || '导入失败'}`)
+        return
+      }
+      if (dryRun) {
+        setImportPreview({ count: d.count, total_reads: d.total_reads, preview: d.preview || [] })
+      } else {
+        setImportText('')
+        setImportPreview(null)
+        setShowImport(false)
+        setMsg(`✓ 已导入 ${d.imported} 条文章数据（累计阅读 ${d.total_reads}）`)
+        await load()
+      }
+    } catch (e) {
+      setMsg(`✗ 导入失败：${e}`)
+    } finally {
+      setImportBusy(false)
     }
   }
 
@@ -207,7 +242,8 @@ export default function MetricsView() {
         <button type="button" style={goBtn} disabled={syncing} onClick={syncWechat}>
           {syncing ? '同步中…' : '🔄 同步公众号数据（近7天）'}
         </button>
-        <button type="button" style={ghostBtn} onClick={() => setShowAdd((v) => !v)}>+ 手动补录</button>
+        <button type="button" style={ghostBtn} onClick={() => { setShowAdd((v) => !v); setShowImport(false) }}>+ 手动补录</button>
+        <button type="button" style={ghostBtn} onClick={() => { setShowImport((v) => !v); setShowAdd(false) }}>📥 粘贴后台数据</button>
         <button type="button" style={ghostBtn} disabled={reviewing} onClick={runReview}>
           {reviewing ? '分析中…' : '✨ AI 复盘本周表现'}
         </button>
@@ -229,6 +265,34 @@ export default function MetricsView() {
             <input value={favCount} onChange={(e) => setFavCount(e.target.value)} placeholder="收藏" type="number" style={{ ...inputStyle, width: 76 }} />
             <input value={likeCount} onChange={(e) => setLikeCount(e.target.value)} placeholder="点赞" type="number" style={{ ...inputStyle, width: 76 }} />
             <button type="button" style={goBtn} onClick={saveManual}>保存</button>
+          </div>
+        </div>
+      )}
+
+      {showImport && (
+        <div style={{ ...card, borderColor: 'rgba(196,167,125,0.5)' }}>
+          <div style={{ fontSize: 12.5, opacity: 0.75, marginBottom: 6 }}>
+            从公众号后台「内容分析 / 图文分析」复制表格行或导出 CSV 直接粘贴进来（支持中文表头：日期、标题、阅读、分享、收藏、在看）
+          </div>
+          <textarea
+            rows={4}
+            value={importText}
+            onChange={(e) => { setImportText(e.target.value); setImportPreview(null) }}
+            placeholder={'日期\t文章标题\t阅读人数\t分享\t收藏\t在看\n2026-11-22\t我用 Claude Code 搭了套工作流\t1280\t45\t92\t31'}
+            style={{ ...inputStyle, width: '100%', boxSizing: 'border-box', resize: 'vertical', marginBottom: 8, fontFamily: 'inherit' }}
+          />
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <button type="button" style={ghostBtn} disabled={importBusy || !importText.trim()} onClick={() => runImport(true)}>
+              预览解析
+            </button>
+            <button type="button" style={goBtn} disabled={importBusy || !importText.trim()} onClick={() => runImport(false)}>
+              {importBusy ? '导入中…' : '确认导入'}
+            </button>
+            {importPreview && (
+              <span style={{ fontSize: 12.5, opacity: 0.85 }}>
+                识别 {importPreview.count} 篇 · 累计阅读 {importPreview.total_reads}
+              </span>
+            )}
           </div>
         </div>
       )}

@@ -139,6 +139,18 @@ def active_source() -> str:
     return "unconfigured"
 
 
+_FAST_MODEL_PRIORITY = (
+    "deepseek-flash",
+    "deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-free",
+    "deepseek-v4.1-flash",
+    "qwen3.8-max",
+    "gpt-5.6-sol",
+    "grok-4.5",
+    "glm-5.3-flash",
+)
+
+
 def current_model() -> str:
     cat = build_model_catalog()
     if cat.get("default"):
@@ -147,6 +159,21 @@ def current_model() -> str:
     if st.get("default_text_model"):
         return str(st["default_text_model"]).strip()
     return (os.getenv("LLM_MODEL") or "").strip()
+
+
+def current_fast_model() -> str:
+    """解析当前实际生效的翻译/快讯/筛选快模型名称。"""
+    st = settings_store.load_settings()
+    user_fast = str(st.get("fast_text_model") or "").strip()
+    if user_fast:
+        return user_fast
+    cat = build_model_catalog()
+    models_map = cat.get("models") or {}
+    if st.get("mode") != "custom":
+        for fid in _FAST_MODEL_PRIORITY:
+            if fid in models_map and models_map[fid].get("api_key"):
+                return fid
+    return current_model()
 
 
 def list_text_models() -> List[Dict[str, str]]:
@@ -366,16 +393,7 @@ def chat_completion_with_meta(
         if user_fast and user_fast in models_map:
             _add_cand(user_fast, models_map[user_fast])
 
-    fast_ids = (
-        "deepseek-v4.1-flash",
-        "deepseek-flash",
-        "deepseek-v4-flash",
-        "deepseek/deepseek-v4-flash-free",
-        "qwen3.8-max",
-        "gpt-5.6-sol",
-        "grok-4.5",
-        "glm-5.3-flash",
-    )
+    fast_ids = _FAST_MODEL_PRIORITY
     if prefer_fast and not model and st.get("mode") != "custom":
         for fid in fast_ids:
             if fid in models_map and models_map[fid].get("api_key"):

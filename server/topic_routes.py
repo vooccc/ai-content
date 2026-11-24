@@ -173,6 +173,14 @@ def refresh_intel(req: RefreshIntelRequest):
         return JSONResponse({"ok": False, "error": f"快讯刷新失败：{e}"}, status_code=500)
 
 
+@router.post("/intel/translate-pending")
+def translate_pending_intel():
+    try:
+        return intel_engine.translate_pending_intel(limit=16)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"翻译失败：{e}"}, status_code=500)
+
+
 class PromoteIntelRequest(BaseModel):
     start_project: bool = False
 
@@ -467,12 +475,119 @@ def sync_wechat_metrics(req: SyncWechatMetricsRequest):
             secret=eff_secret,
         )
     except wechat_mp.WeChatError as e:
-        return JSONResponse({"ok": False, "error": e.message, "errcode": e.errcode}, status_code=400)
+        msg = e.message
+        if e.errcode == 48001:
+            msg = (
+                "微信接口返回 48001（接口未授权）：你的 IP 白名单与草稿箱推送权限正常，"
+                "但微信官方仅向「已微信认证的账号」开放阅读统计接口（datacube），"
+                "个人或未认证订阅号无法通过 API 自动拉取数据。请点旁边「+ 手动补录」或「📥 粘贴后台数据」导入。"
+            )
+        return JSONResponse({"ok": False, "error": msg, "errcode": e.errcode}, status_code=400)
     saved = 0
     for row in rows:
         db.upsert_metric({**row, "source": "datacube"})
         saved += 1
     return {"ok": True, "synced": saved, "begin_date": begin_d.strftime("%Y-%m-%d"), "end_date": end_d.strftime("%Y-%m-%d")}
+
+
+class ImportMetricsRequest(BaseModel):
+    text: str = ""
+    dry_run: bool = False
+
+
+_METRIC_ALIAS = {
+    "title": ("标题", "文章标题", "内容标题", "图文标题", "title"),
+    "ref_date": ("日期", "发表时间", "群发时间", "发布时间", "时间", "ref_date", "date"),
+    "read_user": ("阅读", "阅读人数", "总阅读人数", "阅读量", "图文阅读人数", "read_user", "reads"),
+    "share_count": ("分享", "分享人数", "分享次数", "转发", "转发人数", "share_count", "shares"),
+    "fav_count": ("收藏", "收藏人数", "收藏次数", "fav_count", "favs"),
+    "like_count": ("点赞", "点赞数", "在看", "在看数", "like_count", "likes"),
+}
+
+
+@router.post("/metrics/import")
+def import_metrics_bulk(req: ImportMetricsRequest):
+    """批量解析从公众号后台复制或导出的图文统计表格（制表符 / CSV / JSON）。"""
+    import csv
+    import io
+    t = (req.text or "").strip()
+    if not t:
+        return JSONResponse({"ok": False, "error": "请粘贴公众号后台导出的表格或 CSV/JSON 数据"}, status_code=400)
+    records: List[Dict[str, str]] = []
+    if t[0] in ("[", "{"):
+        try:
+            obj = json.loads(t)
+            arr = obj if isinstance(obj, list) else (obj.get("list") or obj.get("items") or [])
+            if not isinstance(arr, list):
+                return JSONResponse({"ok": False, "error": "JSON 格式需要是数组"}, status_code=400)
+            for it in arr:
+                if not isinstance(it, dict):
+                    continue
+                rec: Dict[str, str] = {}
+                for k, aliases in _METRIC_ALIAS.items():
+                    for a in aliases:
+                        if it.get(a) is not None:
+                            rec[k] = str(it[a])
+                            break
+                records.append(rec)
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"JSON 解析失败：{e}"}, status_code=400)
+    else:
+        first_line = t.splitlines()[0] if t.splitlines() else ""
+        delimiter = "\t" if ("\t" in first_line and "," not in first_line) else ","
+        rows = [r for r in csv.reader(io.StringIO(t), delimiter=delimiter) if any(str(c).strip() for c in r)]
+        if not rows:
+            return JSONResponse({"ok": False, "error": "没有解析到有效数据行"}, status_code=400)
+        head = [str(c).strip().lower() for c in rows[0]]
+        has_header = any(h in _METRIC_ALIAS["title"] or h in _METRIC_ALIAS["read_user"] for h in head)
+        idx_map = {"ref_date": 0, "title": 1, "read_user": 2, "share_count": 3, "fav_count": 4, "like_count": 5}
+        if has_header:
+            idx_map = {k: next((i for i, h in enumerate(head) if h in aliases), -1) for k, aliases in _METRIC_ALIAS.items()}
+            if idx_map.get("title", -1) < 0:
+                return JSONResponse({"ok": False, "error": "表头中未找到「标题 / 文章标题」列"}, status_code=400)
+            rows = rows[1:]
+        for r in rows:
+            rec = {}
+            for k, col_i in idx_map.items():
+                if 0 <= col_i < len(r):
+                    rec[k] = str(r[col_i]).strip()
+            records.append(rec)
+
+    parsed: List[Dict[str, Any]] = []
+    today_str = date.today().strftime("%Y-%m-%d")
+    for rec in records:
+        title = (rec.get("title") or "").strip()
+        if not title:
+            continue
+        raw_d = (rec.get("ref_date") or "").strip()[:10]
+        ref_d = raw_d.replace("/", "-") if len(raw_d) >= 8 and raw_d[:4].isdigit() else today_str
+        reads = topic_engine._parse_cn_num(rec.get("read_user"))
+        parsed.append({
+            "ref_date": ref_d,
+            "title": title,
+            "read_user": reads,
+            "read_count": reads,
+            "share_count": topic_engine._parse_cn_num(rec.get("share_count")),
+            "fav_count": topic_engine._parse_cn_num(rec.get("fav_count")),
+            "like_count": topic_engine._parse_cn_num(rec.get("like_count")),
+            "source": "import",
+        })
+
+    if not parsed:
+        return JSONResponse({"ok": False, "error": "未识别到带标题的数据行"}, status_code=400)
+    if req.dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "count": len(parsed),
+            "total_reads": sum(p["read_user"] for p in parsed),
+            "preview": parsed[:5],
+        }
+    saved = 0
+    for row in parsed:
+        db.upsert_metric(row)
+        saved += 1
+    return {"ok": True, "imported": saved, "total_reads": sum(p["read_user"] for p in parsed)}
 
 
 @router.post("/metrics/review")
@@ -505,6 +620,7 @@ def get_model_settings():
         "settings": settings_store.get_masked_settings(),
         "active_source": llm_bridge.active_source(),
         "current_model": llm_bridge.current_model(),
+        "current_fast_model": llm_bridge.current_fast_model(),
         "text_models": llm_bridge.list_text_models(),
         "image_models": llm_bridge.list_image_models(),
     }
@@ -519,6 +635,7 @@ def put_model_settings(req: UpdateModelSettingsRequest):
         "settings": updated,
         "active_source": llm_bridge.active_source(),
         "current_model": llm_bridge.current_model(),
+        "current_fast_model": llm_bridge.current_fast_model(),
         "text_models": llm_bridge.list_text_models(),
         "image_models": llm_bridge.list_image_models(),
     }

@@ -64,6 +64,10 @@ def _guess_category(title: str, source_type: str) -> str:
     return "AI快讯"
 
 
+def _has_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
 def _summarize_chunk(items: List[Dict[str, Any]], offset: int) -> Dict[int, Dict[str, Any]]:
     if not items:
         return {}
@@ -77,10 +81,10 @@ def _summarize_chunk(items: List[Dict[str, Any]], offset: int) -> Dict[int, Dict
         for i, it in enumerate(items)
     ]
     prompt = (
-        "你是资深 AI 情报编辑。请把下面每条一手英文/中文动态提炼成简洁高信息密度的中文快讯。\n"
+        "你是资深 AI 情报编辑。请把下面每条一手动态全部提炼成流畅、高信息密度的中文快讯。\n"
         "要求：\n"
-        "1. title：20-38字中文快讯标题，直击发生了什么/核心亮点，英文标题必须流畅译成中文，禁止标题党；\n"
-        "2. summary：70-120字中文摘要，说清具体功能、关键数字或适用场景；\n"
+        "1. title：20-38字中文快讯标题，直击核心亮点；英文标题必须译成地道中文（专有项目/模型名如 Claude Code、Gemini 4 可保留英文词，但整句必须是中文）；\n"
+        "2. summary：60-120字纯中文摘要，说清功能、关键数字或结论；\n"
         "3. category：从「大模型动态 / Agent与工具 / 开源项目 / 论文研究 / 行业趋势」选一个；\n"
         "4. tags：2-3个简短标签（如 [\"Claude\", \"开源\"]）。\n"
         f"素材：\n{json.dumps(brief, ensure_ascii=False)}\n"
@@ -89,9 +93,9 @@ def _summarize_chunk(items: List[Dict[str, Any]], offset: int) -> Dict[int, Dict
     try:
         raw = llm_bridge.chat_completion(
             [{"role": "user", "content": prompt}],
-            temperature=0.25,
-            max_tokens=4500,
-            timeout=55,
+            temperature=0.2,
+            max_tokens=3600,
+            timeout=45,
             prefer_fast=True,
         )
         m = re.search(r"(\[[\s\S]*\])", raw)
@@ -111,16 +115,36 @@ def _summarize_batch_with_llm(items: List[Dict[str, Any]]) -> Dict[int, Dict[str
     if not items:
         return {}
     from concurrent.futures import ThreadPoolExecutor
-    chunk_size = 10
+    chunk_size = 6
     chunks = [(i, items[i : i + chunk_size]) for i in range(0, len(items), chunk_size)]
     merged: Dict[int, Dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as pool:
+    with ThreadPoolExecutor(max_workers=min(2, len(chunks))) as pool:
         futs = [pool.submit(_summarize_chunk, ch, off) for off, ch in chunks]
         for fut in futs:
             try:
                 merged.update(fut.result())
             except Exception:
                 pass
+
+    # 补翻兜底：若有分片偶发失败或返回仍无中文标题，对漏网条目再补翻一轮
+    missing_indices = [
+        i for i in range(len(items))
+        if not _has_cjk(str((merged.get(i) or {}).get("title") or ""))
+        and not _has_cjk(str(items[i].get("raw_title") or ""))
+    ]
+    if missing_indices and llm_bridge.active_source():
+        retry_items = [items[i] for i in missing_indices[:16]]
+        retry_chunks = [(k, retry_items[k : k + 8]) for k in range(0, len(retry_items), 8)]
+        with ThreadPoolExecutor(max_workers=min(2, len(retry_chunks))) as pool:
+            futs = [pool.submit(_summarize_chunk, ch, off) for off, ch in retry_chunks]
+            for fut in futs:
+                try:
+                    res = fut.result()
+                    for local_idx, val in res.items():
+                        if 0 <= local_idx < len(missing_indices):
+                            merged[missing_indices[local_idx]] = val
+                except Exception:
+                    pass
     return merged
 
 
@@ -217,7 +241,7 @@ def refresh_intel_stream(limit: int = 36) -> Dict[str, Any]:
 
     picked = _select_balanced_clusters(clustered, max(1, min(limit, 50)))
 
-    llm_map = _summarize_batch_with_llm(picked[:24])
+    llm_map = _summarize_batch_with_llm(picked)
     mode = "llm" if llm_map else "rules"
 
     records: List[Dict[str, Any]] = []
@@ -307,3 +331,47 @@ def promote_intel_to_topic(intel_id: str) -> Dict[str, Any]:
     })
     db.mark_intel_promoted(intel_id, tp["id"])
     return {"topic": tp, "already_existed": False}
+
+
+def translate_pending_intel(limit: int = 16) -> Dict[str, Any]:
+    """把库里尚未翻译成中文的存量英文快讯批量译成中文标题与摘要。"""
+    all_rows = db.list_intel_items(limit=200)
+    pending = [r for r in all_rows if not _has_cjk(r.get("title") or "")][:limit]
+    if not pending:
+        return {"ok": True, "translated": 0, "remaining": 0}
+    fake_items = [
+        {
+            "source_name": r.get("source_name") or r.get("source_type"),
+            "source_type": r.get("source_type") or "",
+            "raw_title": r.get("raw_title") or r.get("title") or "",
+            "raw_summary": r.get("summary") or "",
+        }
+        for r in pending
+    ]
+    llm_map = _summarize_batch_with_llm(fake_items)
+    updates: List[Dict[str, Any]] = []
+    for i, r in enumerate(pending):
+        ai_row = llm_map.get(i) or {}
+        zh_title = str(ai_row.get("title") or "").strip()
+        if not zh_title or not _has_cjk(zh_title):
+            continue
+        updates.append({
+            "cluster_key": r["cluster_key"],
+            "title": zh_title,
+            "summary": str(ai_row.get("summary") or r.get("summary") or "").strip(),
+            "raw_title": r.get("raw_title") or r.get("title") or "",
+            "source_type": r.get("source_type") or "",
+            "source_name": r.get("source_name") or "",
+            "source_url": r.get("source_url") or "",
+            "signals": r.get("signals") or [],
+            "credibility": r.get("credibility") or "社区热议",
+            "metrics_badge": r.get("metrics_badge") or "",
+            "category": str(ai_row.get("category") or r.get("category") or "AI快讯").strip(),
+            "tags": ai_row.get("tags") if isinstance(ai_row.get("tags"), list) else (r.get("tags") or []),
+            "popularity": int(r.get("popularity") or 0),
+        })
+    if updates:
+        db.upsert_intel_items(updates)
+    after = db.list_intel_items(limit=200)
+    remaining = sum(1 for r in after if not _has_cjk(r.get("title") or ""))
+    return {"ok": True, "translated": len(updates), "remaining": remaining}

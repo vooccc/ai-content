@@ -57,6 +57,8 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [translating, setTranslating] = useState(false)
+  const [showRaw, setShowRaw] = useState<Record<string, boolean>>({})
   const [busyId, setBusyId] = useState<string | null>(null)
   const [msg, setMsg] = useState('')
 
@@ -105,6 +107,25 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
       setMsg(`✗ 刷新失败：${e}`)
     } finally {
       setRefreshing(false)
+    }
+  }
+
+  async function translatePending() {
+    setTranslating(true)
+    setMsg('正在把未翻译的英文快讯批量译成中文…')
+    try {
+      const res = await fetch(`${API_BASE}/intel/translate-pending`, { method: 'POST' })
+      const d = await res.json()
+      if (d.ok) {
+        setMsg(`✓ 已翻译 ${d.translated} 条英文快讯${d.remaining > 0 ? `（剩余 ${d.remaining} 条可再点一次）` : '，已全部中文化'}`)
+        await loadIntel(cred, query)
+      } else {
+        setMsg(`✗ 翻译失败：${d.error || '未知错误'}`)
+      }
+    } catch (e) {
+      setMsg(`✗ 翻译失败：${e}`)
+    } finally {
+      setTranslating(false)
     }
   }
 
@@ -208,6 +229,11 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
           <button type="button" style={ghostBtn} onClick={() => loadIntel(cred, query)}>
             搜索
           </button>
+          {items.some((x) => !/[\u4e00-\u9fff]/.test(x.title || '')) && (
+            <button type="button" style={{ ...ghostBtn, borderColor: 'rgba(90,169,230,0.65)' }} disabled={translating} onClick={translatePending}>
+              {translating ? '翻译中…' : `🌐 翻译英文 (${items.filter((x) => !/[\u4e00-\u9fff]/.test(x.title || '')).length})`}
+            </button>
+          )}
           <button type="button" style={goBtn} disabled={refreshing} onClick={refreshNow}>
             {refreshing ? '采集提炼中…' : '🔄 刷新快讯'}
           </button>
@@ -290,9 +316,25 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
               </span>
             </div>
 
-            <div style={{ fontSize: 15.5, fontWeight: 600, lineHeight: 1.4, marginBottom: 6 }}>
-              {it.title}
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 }}>
+              <div style={{ fontSize: 15.5, fontWeight: 600, lineHeight: 1.4, flex: 1 }}>
+                {it.title}
+              </div>
+              {it.raw_title && it.raw_title !== it.title && (
+                <button
+                  type="button"
+                  onClick={() => setShowRaw((p) => ({ ...p, [it.id]: !p[it.id] }))}
+                  style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', fontSize: 11.5, opacity: 0.55, color: 'inherit', flexShrink: 0 }}
+                >
+                  {showRaw[it.id] ? '收起原文' : '原文'}
+                </button>
+              )}
             </div>
+            {showRaw[it.id] && it.raw_title && (
+              <div style={{ fontSize: 12, opacity: 0.6, marginBottom: 6 }}>
+                原文：{it.raw_title}
+              </div>
+            )}
 
             {it.summary && (
               <div style={{ fontSize: 13.5, opacity: 0.85, lineHeight: 1.55, marginBottom: 10 }}>

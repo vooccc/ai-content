@@ -24,6 +24,19 @@ _UA = (
 )
 
 
+def trim_clean(text: str, max_len: int) -> str:
+    """按标点或完整英文词边界安全截断文本，不把英文单词砍半截。"""
+    s = re.sub(r"\s+", " ", (text or "").strip())
+    if len(s) <= max_len:
+        return s
+    cut = s[:max_len]
+    if re.match(r"[A-Za-z0-9]", s[max_len - 1]) and re.match(r"[A-Za-z0-9]", s[max_len]):
+        pos = cut.rfind(" ")
+        if pos >= max_len // 2:
+            return cut[:pos].rstrip(" ,;，；") + "…"
+    return cut.rstrip(" ,;，；") + "…"
+
+
 class _RateLimiter:
     """源级冷却限流器，避免高频请求触发风控。"""
 
@@ -103,7 +116,7 @@ def fetch_github_trending(
                 "source_type": "github_trending",
                 "source_name": "GitHub Trending",
                 "source_url": repo_url,
-                "raw_title": f"{repo}：{desc[:50]}" if desc else repo,
+                "raw_title": f"{repo}：{trim_clean(desc, 64)}" if desc else repo,
                 "raw_summary": " | ".join(summary_parts),
                 "popularity": int(stars_today.replace(",", "")) if stars_today.replace(",", "").isdigit() else 0,
             })
@@ -623,9 +636,9 @@ def fetch_bluesky_topics(
                 ext = ((post.get("embed") or {}).get("external") or {})
                 ext_title = str(ext.get("title") or "").strip()
                 ext_uri = str(ext.get("uri") or "").strip()
-                title = text[:95] + ("…" if len(text) > 95 else "")
+                title = trim_clean(text, 95)
                 if ext_title:
-                    title = f"{ext_title[:70]} — {text[:45]}"
+                    title = f"{trim_clean(ext_title, 70)} — {trim_clean(text, 45)}"
                 extra = f" | 引用: {ext_uri}" if ext_uri else ""
                 author_items.append({
                     "source_type": "bluesky",

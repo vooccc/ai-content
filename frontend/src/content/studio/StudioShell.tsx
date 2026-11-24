@@ -131,6 +131,7 @@ export default function StudioShell({ openProjectId, onConsumedOpenProject }: St
 
   useEffect(() => {
     if (openProjectId) {
+      loadList()
       openProject(openProjectId).finally(() => onConsumedOpenProject?.())
     }
   }, [openProjectId])

@@ -76,6 +76,7 @@ export default function PublishView() {
   const [cfgMode, setCfgMode] = useState<'auto' | 'gateway' | 'custom'>('auto')
   const [activeSource, setActiveSource] = useState('')
   const [currentModel, setCurrentModel] = useState('')
+  const [currentFastModel, setCurrentFastModel] = useState('')
   const [textModelOpts, setTextModelOpts] = useState<{ model: string; name: string; provider_name: string }[]>([])
   const [imageModelOpts, setImageModelOpts] = useState<{ model: string; provider_name: string }[]>([])
   const [gwUrl, setGwUrl] = useState('http://127.0.0.1:8000/gateway/v1')
@@ -144,6 +145,7 @@ export default function PublishView() {
     settings?: Record<string, unknown>
     active_source?: string
     current_model?: string
+    current_fast_model?: string
     text_models?: { model: string; name: string; provider_name: string }[]
     image_models?: { model: string; provider_name: string }[]
   }) {
@@ -161,6 +163,7 @@ export default function PublishView() {
     setTavilyHint(String(s.tavily_api_key_masked || ''))
     setActiveSource(d.active_source || '')
     setCurrentModel(d.current_model || '')
+    setCurrentFastModel(d.current_fast_model || '')
     setTextModelOpts(d.text_models || [])
     setImageModelOpts(d.image_models || [])
   }
@@ -471,7 +474,10 @@ export default function PublishView() {
                 : '未配置'}
             </span>
             {currentModel && (
-              <span style={{ fontSize: 12, opacity: 0.55 }}>· 默认：{currentModel}</span>
+              <span style={{ fontSize: 12, opacity: 0.7 }}>
+                · 写作：{currentModel}{(() => { const p = textModelOpts.find((m) => m.model === currentModel)?.provider_name; return p ? `（${p}）` : '' })()}
+                {currentFastModel ? ` · 翻译/快讯：${currentFastModel}${(() => { const p = textModelOpts.find((m) => m.model === currentFastModel)?.provider_name; return p ? `（${p}）` : '' })()}` : ''}
+              </span>
             )}
             <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
               <button type="button" style={ghostBtn} disabled={testingModel} onClick={testModelConn}>
@@ -523,30 +529,91 @@ export default function PublishView() {
               )}
 
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <div style={{ flex: 1, minWidth: 200, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.7 }}>默认写作模型</span>
-                  <input list="aicontent-text-models" value={defTextModel} onChange={(e) => setDefTextModel(e.target.value)} placeholder="留空自动选择（可下拉选或手填）" style={inputStyle} />
-                </div>
-                <div style={{ flex: 1, minWidth: 200, display: 'flex', flexDirection: 'column', gap: 4 }}>
-                  <span style={{ fontSize: 12, opacity: 0.7 }}>选题筛选快模型（推荐 flash/非思考模型）</span>
-                  <input list="aicontent-text-models" value={fastTextModel} onChange={(e) => setFastTextModel(e.target.value)} placeholder="如 deepseek-v4.1-flash（留空自动挑快模型）" style={inputStyle} />
-                </div>
+                {(() => {
+                  const effWrite = defTextModel || currentModel
+                  const effWriteProv = textModelOpts.find((m) => m.model === effWrite)?.provider_name || ''
+                  const effFast = fastTextModel || currentFastModel
+                  const effFastProv = textModelOpts.find((m) => m.model === effFast)?.provider_name || ''
+                  return (
+                    <>
+                      <div style={{ flex: 1, minWidth: 220, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        <span style={{ fontSize: 12, opacity: 0.7 }}>默认写作模型（大纲 / 撰稿 / 润色）</span>
+                        <select
+                          value={defTextModel}
+                          onChange={(e) => setDefTextModel(e.target.value)}
+                          style={{ ...inputStyle, colorScheme: 'light dark' }}
+                        >
+                          <option value="">
+                            自动（✓ 当前：{currentModel || '跟随柳如烟'}{effWriteProv && !defTextModel ? ` · ${effWriteProv}` : ''}）
+                          </option>
+                          {defTextModel && !textModelOpts.some((m) => m.model === defTextModel) && (
+                            <option value={defTextModel}>✓ [当前] {defTextModel}（自定义）</option>
+                          )}
+                          {textModelOpts.map((m) => {
+                            const isCur = m.model === effWrite
+                            return (
+                              <option key={m.model} value={m.model}>
+                                {isCur ? '✓ [当前] ' : ''}{m.model}（{m.provider_name}）
+                              </option>
+                            )
+                          })}
+                        </select>
+                        {effWrite && (
+                          <span style={{ fontSize: 11.5, opacity: 0.6 }}>
+                            当前生效：{effWriteProv ? `${effWriteProv} · ` : ''}{effWrite}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ flex: 1, minWidth: 220, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        <span style={{ fontSize: 12, opacity: 0.7 }}>翻译 / 快讯 / 选题筛选模型</span>
+                        <select
+                          value={fastTextModel}
+                          onChange={(e) => setFastTextModel(e.target.value)}
+                          style={{ ...inputStyle, colorScheme: 'light dark' }}
+                        >
+                          <option value="">
+                            自动（✓ 当前：{currentFastModel || '自动挑快模型'}{effFastProv && !fastTextModel ? ` · ${effFastProv}` : ''}）
+                          </option>
+                          {fastTextModel && !textModelOpts.some((m) => m.model === fastTextModel) && (
+                            <option value={fastTextModel}>✓ [当前] {fastTextModel}（自定义）</option>
+                          )}
+                          {textModelOpts.map((m) => {
+                            const isCur = m.model === effFast
+                            return (
+                              <option key={m.model} value={m.model}>
+                                {isCur ? '✓ [当前] ' : ''}{m.model}（{m.provider_name}）
+                              </option>
+                            )
+                          })}
+                        </select>
+                        {effFast && (
+                          <span style={{ fontSize: 11.5, opacity: 0.6 }}>
+                            当前生效：{effFastProv ? `${effFastProv} · ` : ''}{effFast}
+                          </span>
+                        )}
+                      </div>
+                    </>
+                  )
+                })()}
                 <div style={{ flex: 1, minWidth: 200, display: 'flex', flexDirection: 'column', gap: 4 }}>
                   <span style={{ fontSize: 12, opacity: 0.7 }}>默认生图模型</span>
-                  <input list="aicontent-image-models" value={defImgModel} onChange={(e) => setDefImgModel(e.target.value)} placeholder="留空则按工作台所选" style={inputStyle} />
+                  <select
+                    value={defImgModel}
+                    onChange={(e) => setDefImgModel(e.target.value)}
+                    style={{ ...inputStyle, colorScheme: 'light dark' }}
+                  >
+                    <option value="">自动（按工作台所选）</option>
+                    {defImgModel && !imageModelOpts.some((m) => m.model === defImgModel) && (
+                      <option value={defImgModel}>✓ [当前] {defImgModel}（自定义）</option>
+                    )}
+                    {imageModelOpts.map((m) => (
+                      <option key={m.model} value={m.model}>
+                        {m.model === defImgModel ? '✓ [当前] ' : ''}{m.model}（{m.provider_name}）
+                      </option>
+                    ))}
+                  </select>
                 </div>
               </div>
-
-              <datalist id="aicontent-text-models">
-                {textModelOpts.map((m) => (
-                  <option key={m.model} value={m.model}>{m.provider_name} · {m.name}</option>
-                ))}
-              </datalist>
-              <datalist id="aicontent-image-models">
-                {imageModelOpts.map((m) => (
-                  <option key={m.model} value={m.model}>{m.provider_name}</option>
-                ))}
-              </datalist>
 
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <input value={imgBaseUrl} onChange={(e) => setImgBaseUrl(e.target.value)} placeholder="独立生图 Base URL（可选，不填则复用上方/柳如烟）" style={{ ...inputStyle, flex: 2, minWidth: 220 }} />

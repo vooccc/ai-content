@@ -509,6 +509,68 @@ class TestSlice2TopicsAndMetrics(unittest.TestCase):
         self.assertIn("Agent Memory Post", b_items[0]["raw_title"])
         self.assertEqual(intel_engine.classify_credibility(b_items[0]), "社区热议")
 
+    def test_metrics_bulk_import_and_48001_message(self):
+        from fastapi.testclient import TestClient
+        from server.app import app
+        from server import wechat_mp
+
+        client = TestClient(app)
+        tsv = "发表时间\t文章标题\t总阅读人数\t分享人数\t收藏人数\t在看\n2026-11-22\t实测 Claude Code 工作流\t1.2万\t45\t92\t31\n"
+        r_pre = client.post("/metrics/import", json={"text": tsv, "dry_run": True})
+        self.assertEqual(r_pre.status_code, 200)
+        pre = r_pre.json()
+        self.assertTrue(pre["ok"])
+        self.assertEqual(pre["count"], 1)
+        self.assertEqual(pre["total_reads"], 12000)
+
+        r_imp = client.post("/metrics/import", json={"text": tsv, "dry_run": False})
+        self.assertEqual(r_imp.status_code, 200)
+        self.assertEqual(r_imp.json()["imported"], 1)
+
+        with patch("server.wechat_mp.fetch_article_total", side_effect=wechat_mp.WeChatError("unauth", errcode=48001)):
+            r_sync = client.post("/metrics/sync-wechat", json={"days": 7})
+        self.assertEqual(r_sync.status_code, 400)
+        self.assertIn("IP 白名单与草稿箱推送权限正常", r_sync.json()["error"])
+
+    def test_intel_translate_pending_and_full_batch(self):
+        from server import db, intel_engine
+        db.upsert_intel_items([{
+            "cluster_key": "u_en_test_1",
+            "title": "Pure English Paper Title",
+            "summary": "Pure English summary body",
+            "raw_title": "Pure English Paper Title",
+            "source_type": "hf_papers",
+            "source_name": "HF Daily Papers",
+            "source_url": "https://huggingface.co/papers/9999.00001",
+            "credibility": "一手官方",
+        }])
+        fake_reply = '[{"idx": 0, "title": "纯英文论文的中文快讯标题", "summary": "中文摘要说明核心成果", "category": "论文研究", "tags": ["论文"]}]'
+        with patch("server.llm_bridge.active_source", return_value="mock"), \
+             patch("server.llm_bridge.chat_completion", return_value=fake_reply):
+            res = intel_engine.translate_pending_intel(limit=20)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["translated"], 1)
+        self.assertEqual(res["remaining"], 0)
+        items = db.list_intel_items(limit=10)
+        self.assertEqual(items[0]["title"], "纯英文论文的中文快讯标题")
+        self.assertEqual(items[0]["raw_title"], "Pure English Paper Title")
+
+    def test_smart_short_title_no_midword_cut(self):
+        from server import sources, topic_engine
+        full = "【中配】57分钟带你拆解 Agent 设计模式，从ReAct到上下文工程"
+        short = topic_engine._smart_short_title(full, max_len=36)
+        self.assertEqual(short, "57分钟带你拆解 Agent 设计模式，从ReAct到上下文工程")
+        self.assertNotIn("从R", short.replace("ReAct", ""))
+
+        # 超长英文词边界测试：不能把 SuperLongWord 砍成 Super
+        long_title = "深入解析多智能体协作架构中的 ContextEngineeringBestPractices 与实战落地"
+        s2 = topic_engine._smart_short_title(long_title, max_len=30)
+        self.assertNotIn("ContextE", s2)
+
+        # sources.trim_clean 边界测试
+        trimmed = sources.trim_clean("An open source autonomous coding assistant framework", 28)
+        self.assertFalse(trimmed.endswith("autono…"))
+
 
 if __name__ == "__main__":
     unittest.main()

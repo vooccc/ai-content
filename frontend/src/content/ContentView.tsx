@@ -23,6 +23,13 @@ const NAV_ITEMS: { key: NavTab; icon: string; label: string }[] = [
 
 export default function ContentView({ theme = 'dark', onToggleTheme }: ContentViewProps) {
   const [tab, setTab] = useState<NavTab>('topics')
+  const [visited, setVisited] = useState<Record<NavTab, boolean>>({
+    intel: false,
+    topics: true,
+    studio: false,
+    publish: false,
+    metrics: false,
+  })
   const [openProjectId, setOpenProjectId] = useState<string | undefined>(undefined)
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     try {
@@ -44,9 +51,14 @@ export default function ContentView({ theme = 'dark', onToggleTheme }: ContentVi
     })
   }
 
+  function switchTab(next: NavTab) {
+    setTab(next)
+    setVisited((prev) => (prev[next] ? prev : { ...prev, [next]: true }))
+  }
+
   function handleOpenProject(pid: string) {
     setOpenProjectId(pid)
-    setTab('studio')
+    switchTab('studio')
   }
 
   return (
@@ -107,7 +119,7 @@ export default function ContentView({ theme = 'dark', onToggleTheme }: ContentVi
                 key={item.key}
                 type="button"
                 title={collapsed ? item.label : undefined}
-                onClick={() => setTab(item.key)}
+                onClick={() => switchTab(item.key)}
                 style={{
                   display: 'flex',
                   alignItems: 'center',
@@ -161,17 +173,35 @@ export default function ContentView({ theme = 'dark', onToggleTheme }: ContentVi
         )}
       </aside>
 
-      <main style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex' }}>
-        {tab === 'intel' && <IntelView onOpenProject={handleOpenProject} onGoTopics={() => setTab('topics')} />}
-        {tab === 'topics' && <TopicsView onOpenProject={handleOpenProject} />}
-        {tab === 'studio' && (
-          <StudioShell
-            openProjectId={openProjectId}
-            onConsumedOpenProject={() => setOpenProjectId(undefined)}
-          />
+      <main style={{ flex: 1, minWidth: 0, minHeight: 0, display: 'flex', position: 'relative' }}>
+        {visited.intel && (
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: tab === 'intel' ? 'flex' : 'none' }}>
+            <IntelView onOpenProject={handleOpenProject} onGoTopics={() => switchTab('topics')} />
+          </div>
         )}
-        {tab === 'publish' && <PublishView />}
-        {tab === 'metrics' && <MetricsView />}
+        {visited.topics && (
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: tab === 'topics' ? 'flex' : 'none' }}>
+            <TopicsView onOpenProject={handleOpenProject} />
+          </div>
+        )}
+        {visited.studio && (
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: tab === 'studio' ? 'flex' : 'none' }}>
+            <StudioShell
+              openProjectId={openProjectId}
+              onConsumedOpenProject={() => setOpenProjectId(undefined)}
+            />
+          </div>
+        )}
+        {visited.publish && (
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: tab === 'publish' ? 'flex' : 'none' }}>
+            <PublishView />
+          </div>
+        )}
+        {visited.metrics && (
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: tab === 'metrics' ? 'flex' : 'none' }}>
+            <MetricsView />
+          </div>
+        )}
       </main>
     </div>
   )

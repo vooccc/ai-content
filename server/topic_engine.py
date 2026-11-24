@@ -352,6 +352,35 @@ def dedupe_candidates(
     return kept
 
 
+def _smart_short_title(raw_title: str, max_len: int = 36) -> str:
+    """清理【中配】等标签后尽量完整保留核心主题；超长时在标点或完整英文词边界收口，避免砍半截字母。"""
+    s = re.sub(r"^(?:【[^】]{1,8}】|\[[^\]]{1,8}\])\s*", "", (raw_title or "").strip())
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return (raw_title or "").strip()[:max_len]
+    # 若含主副标题冒号且前半段已有足够信息（>=6字），优先取前半段
+    for sep in ("：", ":"):
+        if sep in s:
+            head = s.split(sep, 1)[0].strip()
+            if len(head) >= 6:
+                s = head
+                break
+    if len(s) <= max_len:
+        return s
+    cut = s[:max_len]
+    # 优先在中文/英文标点处自然收口
+    for p in ("，", ",", "、", "—", "｜", "|", "；"):
+        pos = cut.rfind(p)
+        if pos >= max_len // 2:
+            return cut[:pos].strip()
+    # 若结尾刚好落在英文/数字单词中间，退回该词之前（或空格处）
+    if len(s) > max_len and re.match(r"[A-Za-z0-9]", s[max_len - 1]) and re.match(r"[A-Za-z0-9]", s[max_len]):
+        m = re.search(r"[A-Za-z0-9._-]+$", cut)
+        if m and m.start() >= max_len // 2:
+            return cut[: m.start()].rstrip(" ，,、—-|")
+    return cut.rstrip(" ，,、—-|")
+
+
 def _heuristic_score_item(item: Dict[str, Any], account: Dict[str, Any]) -> Dict[str, Any]:
     text = f"{item.get('raw_title', '')} {item.get('raw_summary', '')}".lower()
     score = 50
@@ -381,7 +410,7 @@ def _heuristic_score_item(item: Dict[str, Any], account: Dict[str, Any]) -> Dict
     score = max(35, min(98, score))
 
     raw_title = str(item.get("raw_title") or "").strip()
-    short_name = raw_title.split("：")[0].split(":")[0].strip()[:26]
+    short_name = _smart_short_title(raw_title, max_len=36)
     if st == "github_trending":
         cat = "周二实操"
         titles = [
@@ -514,7 +543,7 @@ def _score_and_rewrite_with_llm(
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
             temperature=0.4,
             max_tokens=4096,
-            timeout=40,
+            timeout=55,
             prefer_fast=True,
         )
     except Exception:
