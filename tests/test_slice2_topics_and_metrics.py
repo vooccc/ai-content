@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -684,6 +684,287 @@ class TestSlice2TopicsAndMetrics(unittest.TestCase):
             self.assertEqual(res200.status_code, 200)
             self.assertEqual(res200.json()["count"], 1)  # 同 URL 去重合并
             self.assertTrue(mpost.called)
+
+    def test_xiaohongshu_dual_engine_xhshow_and_opencli(self):
+        from server import settings_store, sources
+        from server.app import app
+        from fastapi.testclient import TestClient
+
+        self.assertEqual(sources._parse_xhs_like_count("1.2万"), 12000)
+        self.assertEqual(sources._parse_xhs_like_count("350+"), 350)
+        parsed_ck = sources._parse_xhs_cookie_str("Cookie: a1=abc123; web_session=ws999; nickname=中文名")
+        self.assertEqual(parsed_ck, {"a1": "abc123", "web_session": "ws999"})
+
+        client = TestClient(app)
+        res_save = client.post(
+            "/topics/sources/xhs-auth",
+            json={
+                "cookie": "a1=test_a1_token_123456; web_session=test_ws_987654",
+                "xhs_mode": "xhshow",
+                "xhs_keywords": ["AI工具", "一人公司"],
+            },
+        )
+        self.assertEqual(res_save.status_code, 200)
+        self.assertTrue(res_save.json()["xhs_auth"]["has_xhs_cookie"])
+        self.assertNotIn("test_ws_987654", res_save.json()["xhs_auth"]["xhs_cookie_masked"])
+
+        fake_feed = {
+            "success": True,
+            "data": {
+                "items": [{
+                    "id": "6900112233445566778899aa",
+                    "xsec_token": "tok_feed_1",
+                    "note_card": {
+                        "display_title": "Claude Code 一人公司实战复盘",
+                        "type": "normal",
+                        "user": {"nickname": "独立开发者阿杰"},
+                        "interact_info": {"liked_count": "1.5万", "collected_count": "3200"},
+                    },
+                }]
+            },
+        }
+        fake_search = {
+            "success": True,
+            "data": {
+                "items": [{
+                    "id": "6900112233445566778899bb",
+                    "xsec_token": "tok_search_2",
+                    "note_card": {
+                        "display_title": "AI Agent 自动化工作流拆解",
+                        "type": "video",
+                        "user": {"nickname": "效率实验室"},
+                        "interact_info": {"liked_count": "8200", "collected_count": "1100"},
+                    },
+                }]
+            },
+        }
+        sources._XHS_CACHE["items"] = []
+        with patch("server.sources.requests.post") as mpost, patch("server.sources.requests.get") as mget:
+            def _post_side_effect(url, **kwargs):
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.raise_for_status = lambda: None
+                if "homefeed" in url:
+                    resp.json.return_value = fake_feed
+                elif "search/notes" in url:
+                    resp.json.return_value = fake_search
+                else:
+                    resp.json.return_value = {"success": True, "data": {}}
+                return resp
+
+            mpost.side_effect = _post_side_effect
+            mget.return_value.status_code = 200
+            mget.return_value.raise_for_status = lambda: None
+            mget.return_value.json.return_value = {"success": True, "data": {}}
+
+            res_xh = client.post("/topics/sources/test-xhs", json={"xhs_mode": "xhshow"})
+            self.assertEqual(res_xh.status_code, 200)
+            self.assertEqual(res_xh.json()["count"], 2)
+            self.assertIn("xsec_token=", res_xh.json()["samples"][0]["url"])
+
+        # 测试 OpenCLI 引擎解析与未安装提示
+        with patch("server.sources._find_opencli_bin", return_value=""):
+            res_no_cli = client.post("/topics/sources/test-xhs", json={"xhs_mode": "opencli"})
+            self.assertEqual(res_no_cli.status_code, 400)
+            self.assertIn("opencli", res_no_cli.json()["error"].lower())
+
+        fake_cli_out = json.dumps([
+            {"title": "OpenCLI 抓到的高赞 AI 笔记", "author": "测试博主", "likes": "2.3万", "url": "https://www.xiaohongshu.com/explore/abc?xsec_token=t1"}
+        ])
+        with patch("server.sources._find_opencli_bin", return_value="opencli"), \
+             patch("server.sources._get_opencli_daemon_status", return_value={"running": True, "extension_connected": False, "version": "2.0.3"}):
+            res_no_ext = client.post("/topics/sources/test-xhs", json={"xhs_mode": "opencli"})
+            self.assertEqual(res_no_ext.status_code, 400)
+            self.assertIn("扩展", res_no_ext.json()["error"])
+
+        with patch("server.sources._find_opencli_bin", return_value="opencli"), \
+             patch("server.sources._get_opencli_daemon_status", return_value={"running": True, "extension_connected": True, "version": "2.0.3"}), \
+             patch("server.sources.subprocess.run") as mrun:
+            mrun.return_value.returncode = 0
+            mrun.return_value.stdout = fake_cli_out
+            mrun.return_value.stderr = ""
+            res_cli = client.post("/topics/sources/test-xhs", json={"xhs_mode": "opencli"})
+            self.assertEqual(res_cli.status_code, 200)
+            self.assertEqual(res_cli.json()["mode"], "opencli")
+            self.assertEqual(res_cli.json()["count"], 1)
+
+    def test_intel_source_filter_and_counts(self):
+        from fastapi.testclient import TestClient
+        from server.app import app
+        from server import db, intel_engine, topic_engine
+
+        db.upsert_intel_items([
+            {
+                "cluster_key": "k_x_1",
+                "title": "X 独家爆料",
+                "summary": "s1",
+                "raw_title": "X exclusive",
+                "source_type": "x",
+                "source_name": "X·Sam",
+                "source_url": "https://x.com/sam/status/1",
+                "signals": [{"source_type": "x", "source_name": "X·Sam", "title": "X exclusive", "url": "https://x.com/sam/status/1"}],
+                "credibility": "社区热议",
+                "category": "大模型动态",
+                "tags": ["X"],
+                "popularity": 500,
+            },
+            {
+                "cluster_key": "k_xhs_1",
+                "title": "小红书 AI 实操爆款",
+                "summary": "s2",
+                "raw_title": "AI实操笔记",
+                "source_type": "xiaohongshu",
+                "source_name": "小红书热搜·测试",
+                "source_url": "https://www.xiaohongshu.com/explore/xhs1",
+                "signals": [{"source_type": "xiaohongshu", "source_name": "小红书热搜·测试", "title": "AI实操笔记", "url": "https://www.xiaohongshu.com/explore/xhs1"}],
+                "credibility": "社区热议",
+                "category": "Agent与工具",
+                "tags": ["小红书"],
+                "popularity": 1200,
+            },
+            {
+                "cluster_key": "k_rss_1",
+                "title": "OpenAI 官方博客",
+                "summary": "s3",
+                "raw_title": "OpenAI post",
+                "source_type": "rss",
+                "source_name": "OpenAI News",
+                "source_url": "https://openai.com/news/test-x-slug",
+                "signals": [{"source_type": "rss", "source_name": "OpenAI News", "title": "OpenAI post", "url": "https://openai.com/news/test-x-slug"}],
+                "credibility": "一手官方",
+                "category": "大模型动态",
+                "tags": ["OpenAI"],
+                "popularity": 100,
+            },
+        ])
+        client = TestClient(app)
+        res_all = client.get("/intel").json()
+        self.assertEqual(res_all["source_counts"].get("x"), 1)
+        self.assertEqual(res_all["source_counts"].get("xiaohongshu"), 1)
+        self.assertEqual(res_all["source_counts"].get("rss"), 1)
+
+        res_x = client.get("/intel", params={"source_type": "x"}).json()
+        self.assertEqual(len(res_x["items"]), 1)
+        self.assertEqual(res_x["items"][0]["source_type"], "x")
+
+        res_xhs = client.get("/intel", params={"source_type": "xiaohongshu"}).json()
+        self.assertEqual(len(res_xhs["items"]), 1)
+        self.assertEqual(res_xhs["items"][0]["source_type"], "xiaohongshu")
+
+        picked = intel_engine._select_balanced_clusters(
+            [
+                {"source_type": "rss", "source_name": "arXiv cs.AI", "popularity": 100},
+                {"source_type": "rss", "source_name": "arXiv cs.AI", "popularity": 90},
+                {"source_type": "rss", "source_name": "arXiv cs.AI", "popularity": 80},
+                {"source_type": "xiaohongshu", "source_name": "小红书热搜", "popularity": 50},
+                {"source_type": "x", "source_name": "X·OpenAI", "popularity": 60},
+            ],
+            limit=3,
+        )
+        picked_types = {p["source_type"] for p in picked}
+        self.assertIn("x", picked_types)
+        self.assertIn("xiaohongshu", picked_types)
+
+        # 验证仅含泛词 "AI Agent" 的不相关笔记不会被错聚成一簇，且均衡采样保护小红书热搜与 X
+        c_res = topic_engine.cluster_candidates([
+            {"source_type": "xiaohongshu", "source_name": "小红书热搜·A", "source_url": "u1", "raw_title": "财务技能+AI Agent一个人也能启动副业", "popularity": 100},
+            {"source_type": "xiaohongshu", "source_name": "小红书热搜·B", "source_url": "u2", "raw_title": "Codex 千万别裸装，这几个 AI Agent Skills 必须装上", "popularity": 900},
+        ])
+        self.assertEqual(len(c_res), 2)
+
+        many_rss = [
+            {"source_type": "rss", "source_name": "RSS", "raw_title": f"RSS {i}", "popularity": 9999 - i, "metrics_badge": "低粉爆款 ×20"}
+            for i in range(40)
+        ]
+        many_rss.append({"source_type": "xiaohongshu", "source_name": "小红书热搜·C", "raw_title": "XHS Hot", "popularity": 50})
+        many_rss.append({"source_type": "x", "source_name": "X·Sam", "raw_title": "X Post", "popularity": 40})
+        bal = topic_engine._select_balanced_topic_candidates(many_rss, limit=12)
+        bal_types = {b["source_type"] for b in bal}
+        self.assertIn("xiaohongshu", bal_types)
+        self.assertIn("x", bal_types)
+
+        db.insert_topic({
+            "account_id": db.get_primary_account()["id"],
+            "source_type": "bilibili",
+            "source_name": "B站·UP",
+            "source_url": "https://bilibili.com/video/1",
+            "raw_title": "聚合主题",
+            "raw_summary": "sum",
+            "suggested_titles": ["聚合主题"],
+            "raw_signals": [
+                {"source_type": "bilibili", "source_name": "B站·UP", "title": "聚合主题", "url": "https://bilibili.com/video/1"},
+                {"source_type": "xiaohongshu", "source_name": "小红书热搜·D", "title": "同款笔记", "url": "https://xiaohongshu.com/explore/2"},
+            ],
+            "score": 88,
+            "status": "new",
+        })
+        self.assertGreaterEqual(db.topic_source_counts().get("xiaohongshu", 0), 1)
+        xhs_topics = db.list_topics(source_type="xiaohongshu")
+        self.assertTrue(any(t["raw_title"] == "聚合主题" for t in xhs_topics))
+
+    def test_xhs_engagement_badge_and_enrich_route(self):
+        from fastapi.testclient import TestClient
+        from server.app import app
+        from server import db, intel_engine, sources
+
+        self.assertEqual(sources._format_xhs_engagement_badge(50000, 7114, 1317), "👍 5万 · ⭐ 7114 · 💬 1317")
+        self.assertEqual(sources._format_xhs_engagement_badge(18500, 0, 0), "👍 1.9万")
+
+        tp = db.insert_topic({
+            "source_type": "xiaohongshu",
+            "source_name": "小红书热搜·测试博主",
+            "source_url": "https://www.xiaohongshu.com/explore/6ade9b2a00000000180257ae?xsec_token=abc",
+            "raw_title": "用 AI Skill 自动整理数据",
+            "raw_summary": "👍 1.2万 · 作者 测试博主",
+            "engagement_badge": "👍 1.2万",
+            "engagement": {"likes": 12000, "collects": 0, "comments": 0},
+            "score": 88,
+        })
+        self.assertEqual(tp["engagement_badge"], "👍 1.2万")
+        self.assertEqual(tp["engagement"].get("likes"), 12000)
+
+        with patch.object(
+            sources,
+            "fetch_xiaohongshu_note_detail",
+            return_value={
+                "likes": 12500,
+                "collects": 3400,
+                "comments": 420,
+                "content": "完整实操步骤：第一步配置 Skill，第二步接飞书自动出周报。",
+                "engagement": {"likes": 12500, "collects": 3400, "comments": 420},
+                "engagement_badge": "👍 1.2万 · ⭐ 3400 · 💬 420",
+            },
+        ):
+            client = TestClient(app)
+            r = client.post(f"/topics/{tp['id']}/enrich")
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["topic"]["engagement_badge"], "👍 1.2万 · ⭐ 3400 · 💬 420")
+            self.assertEqual(body["topic"]["engagement"]["collects"], 3400)
+            self.assertEqual(body["topic"]["engagement"]["comments"], 420)
+            self.assertIn("第一步配置 Skill", body["topic"]["raw_summary"])
+
+        # 快讯升格选题时透传 engagement_badge & engagement
+        db.upsert_intel_items([
+            {
+                "cluster_key": "xhs_eng_1",
+                "title": "小红书高赞 AI 工作流实测",
+                "summary": "详细拆解",
+                "raw_title": "小红书高赞 AI 工作流实测",
+                "source_type": "xiaohongshu",
+                "source_name": "小红书热搜·A",
+                "source_url": "https://www.xiaohongshu.com/explore/1111222233334444",
+                "engagement_badge": "👍 2.5万 · ⭐ 8900 · 💬 650",
+                "engagement": {"likes": 25000, "collects": 8900, "comments": 650},
+                "popularity": 25000,
+            }
+        ])
+        items = db.list_intel_items(source_type="xiaohongshu")
+        xhs_in = [x for x in items if x["cluster_key"] == "xhs_eng_1"][0]
+        promoted = intel_engine.promote_intel_to_topic(xhs_in["id"])
+        self.assertEqual(promoted["topic"]["engagement_badge"], "👍 2.5万 · ⭐ 8900 · 💬 650")
+        self.assertEqual(promoted["topic"]["engagement"]["comments"], 650)
 
 
 if __name__ == "__main__":

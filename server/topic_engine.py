@@ -35,6 +35,11 @@ _GENERIC_STOPWORDS = {
     "python", "typescript", "github", "open", "source", "new", "app", "web",
 }
 
+_CLUSTER_GENERIC_WORDS = _GENERIC_STOPWORDS | {
+    "agent", "agents", "llm", "llms", "model", "models", "code", "coding",
+    "claude", "openai", "gpt", "deepseek", "一人公司", "副业", "实操", "效率", "工作流",
+}
+
 _EXPANSION_CACHE_TTL = 7 * 86400
 
 
@@ -158,17 +163,17 @@ def _extract_entities(item: Dict[str, Any]) -> List[str]:
 
 
 def _cluster_tokens(text: str) -> set[str]:
-    """提取用于事件聚类的中英文混合 token（英文词 + 中文 2-gram + 单字）。"""
+    """提取用于事件聚类的中英文混合 token（英文词 + 中文 2-gram，剔除泛词和单字噪音）。"""
     s = (text or "").lower()
     tokens: set[str] = set()
     for w in re.findall(r"[a-z0-9][a-z0-9_.-]{1,24}", s):
-        if w not in _GENERIC_STOPWORDS:
+        if w not in _CLUSTER_GENERIC_WORDS:
             tokens.add(w)
     zh_chars = re.findall(r"[\u4e00-\u9fff]", s)
-    for ch in zh_chars:
-        tokens.add(ch)
     for i in range(len(zh_chars) - 1):
-        tokens.add(zh_chars[i] + zh_chars[i + 1])
+        bg = zh_chars[i] + zh_chars[i + 1]
+        if bg not in _CLUSTER_GENERIC_WORDS:
+            tokens.add(bg)
     return tokens
 
 
@@ -195,7 +200,7 @@ def compute_viral_badge(plays: int, followers: int) -> tuple[str, int]:
     return "", 0
 
 
-def cluster_candidates(items: List[Dict[str, Any]], threshold: float = 0.24) -> List[Dict[str, Any]]:
+def cluster_candidates(items: List[Dict[str, Any]], threshold: float = 0.34) -> List[Dict[str, Any]]:
     """中英文事件聚类：把讨论同一事件/工具的多源素材聚成 1 张主卡，保留全部原始信源。"""
     clusters: List[Dict[str, Any]] = []
     source_labels = {
@@ -205,6 +210,7 @@ def cluster_candidates(items: List[Dict[str, Any]], threshold: float = 0.24) -> 
         "reddit": "Reddit",
         "bluesky": "Bluesky",
         "x": "X",
+        "xiaohongshu": "小红书",
         "bilibili": "B站",
         "weibo_hot": "微博热搜",
         "wechat_search": "公众号",
@@ -298,6 +304,11 @@ def annotate_cross_source_resonance(items: List[Dict[str, Any]]) -> List[Dict[st
     source_labels = {
         "github_trending": "GitHub",
         "hackernews": "HN",
+        "hf_papers": "HF论文",
+        "reddit": "Reddit",
+        "bluesky": "Bluesky",
+        "x": "X",
+        "xiaohongshu": "小红书",
         "bilibili": "B站",
         "weibo_hot": "微博热搜",
         "wechat_search": "公众号",
@@ -484,20 +495,39 @@ def _extract_json_array(text: str) -> Optional[List[Dict[str, Any]]]:
         data = json.loads(s)
         return data if isinstance(data, list) else None
     except Exception:
-        return None
+        # 若模型输出在末尾被截断，抢救所有已完整闭合的 JSON 对象
+        start = s.find("[")
+        if start == -1:
+            return None
+        dec = json.JSONDecoder()
+        pos = start + 1
+        recovered: List[Dict[str, Any]] = []
+        while pos < len(s):
+            while pos < len(s) and s[pos] in " \t\r\n,":
+                pos += 1
+            if pos >= len(s) or s[pos] == "]":
+                break
+            try:
+                obj, end = dec.raw_decode(s, pos)
+                if isinstance(obj, dict):
+                    recovered.append(obj)
+                pos = end
+            except Exception:
+                break
+        return recovered if recovered else None
 
 
-def _score_and_rewrite_with_llm(
-    candidates: List[Dict[str, Any]],
+def _score_and_rewrite_chunk(
+    chunk: List[Dict[str, Any]],
+    offset: int,
     account: Dict[str, Any],
-    top_n: int = 10,
+    top_titles: List[str],
+    chunk_top_n: int,
 ) -> Optional[List[Dict[str, Any]]]:
-    if not candidates:
-        return []
     brief_list = []
-    for idx, it in enumerate(candidates[:18]):
+    for i, it in enumerate(chunk):
         brief_list.append({
-            "idx": idx,
+            "idx": offset + i,
             "source": it.get("source_name"),
             "title": it.get("raw_title"),
             "summary": str(it.get("raw_summary") or "")[:220],
@@ -505,9 +535,6 @@ def _score_and_rewrite_with_llm(
             "resonance_sources": it.get("resonance_sources") or [],
             "popularity": int(it.get("popularity") or 0),
         })
-
-    top_metrics = sorted(db.list_metrics(limit=30), key=lambda m: int(m.get("read_user") or 0), reverse=True)[:5]
-    top_titles = [m["title"] for m in top_metrics if m.get("title")]
 
     sys_prompt = (
         "你是一位资深公众号主编，专门服务「AI 工具实操 + 一人公司真实经验」账号。\n"
@@ -526,7 +553,8 @@ def _score_and_rewrite_with_llm(
         + f"\n\n【筛选规则】\n"
         "1. 必须评估 is_real：遇到无实质内容的标题党、SEO 内容农场洗稿、纯情绪焦虑贩卖或无来源传闻，设 is_real=false 直接淘汰。\n"
         "2. 优先保留有客观热度（popularity 高）、命中 matched_terms 或跨多源共振（resonance_sources 非空）且能写实操步骤/避坑/测评的选题。\n"
-        f"3. 挑选最契合的最多 {top_n} 条，每条返回 JSON 对象：\n"
+        "3. 兼顾信源多样性，避免单一平台霸榜（X、小红书、GitHub、B站、RSS 的高价值代表都尽量保留）。\n"
+        f"4. 挑选最契合的最多 {chunk_top_n} 条，每条返回 JSON 对象：\n"
         "[\n"
         "  {\n"
         '    "idx": 0,\n'
@@ -549,21 +577,57 @@ def _score_and_rewrite_with_llm(
         )
     except Exception:
         return None
+    return _extract_json_array(raw)
 
-    parsed = _extract_json_array(raw)
-    if not parsed:
+
+def _score_and_rewrite_with_llm(
+    candidates: List[Dict[str, Any]],
+    account: Dict[str, Any],
+    top_n: int = 10,
+) -> Optional[List[Dict[str, Any]]]:
+    if not candidates:
+        return []
+    window = candidates[:28]
+    top_metrics = sorted(db.list_metrics(limit=30), key=lambda m: int(m.get("read_user") or 0), reverse=True)[:5]
+    top_titles = [m["title"] for m in top_metrics if m.get("title")]
+
+    from concurrent.futures import ThreadPoolExecutor
+    import math
+    chunk_size = 10
+    chunks = [(i, window[i : i + chunk_size]) for i in range(0, len(window), chunk_size)]
+    per_chunk_n = max(4, min(8, math.ceil(top_n / max(1, len(chunks))) + 1))
+
+    parsed_rows: List[Dict[str, Any]] = []
+    any_ok = False
+    with ThreadPoolExecutor(max_workers=min(2, len(chunks))) as pool:
+        futs = [
+            pool.submit(_score_and_rewrite_chunk, ch, off, account, top_titles, per_chunk_n)
+            for off, ch in chunks
+        ]
+        for fut in futs:
+            try:
+                res = fut.result()
+                if res is not None:
+                    any_ok = True
+                    parsed_rows.extend(res)
+            except Exception:
+                pass
+
+    if not any_ok:
         return None
 
     out: List[Dict[str, Any]] = []
-    for row in parsed:
+    seen_idx: set[int] = set()
+    for row in parsed_rows:
         if not isinstance(row, dict):
             continue
         if row.get("is_real") is False:
             continue
         idx = row.get("idx")
-        if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
+        if not isinstance(idx, int) or idx < 0 or idx >= len(window) or idx in seen_idx:
             continue
-        base = candidates[idx]
+        seen_idx.add(idx)
+        base = window[idx]
         score = int(row.get("score") or 70)
         res_sources = base.get("resonance_sources") or []
         if len(res_sources) >= 2:
@@ -593,7 +657,64 @@ def _score_and_rewrite_with_llm(
     return out[:top_n]
 
 
-def refresh_topics(max_new: int = 8) -> Dict[str, Any]:
+def _select_balanced_topic_candidates(items: List[Dict[str, Any]], limit: int = 28) -> List[Dict[str, Any]]:
+    """按平台分桶轮询抽样送审，防止单一高产或低粉爆款源把 X/小红书/GitHub 挤出候选窗口。"""
+    def _bkey(x: Dict[str, Any]) -> str:
+        st = str(x.get("source_type") or "other")
+        sn = str(x.get("source_name") or "")
+        if st == "xiaohongshu":
+            return "xiaohongshu:hot" if sn.startswith("小红书热搜") else "xiaohongshu:feed"
+        return st
+
+    buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for it in items:
+        buckets[_bkey(it)].append(it)
+
+    for arr in buckets.values():
+        arr.sort(
+            key=lambda x: (
+                bool(x.get("metrics_badge")),
+                len(x.get("resonance_sources") or []) >= 2,
+                len(x.get("matched_terms") or []) > 0,
+                int(x.get("popularity") or 0),
+            ),
+            reverse=True,
+        )
+
+    priority = [
+        "xiaohongshu:hot",
+        "x",
+        "github_trending",
+        "bilibili",
+        "hackernews",
+        "hf_papers",
+        "reddit",
+        "bluesky",
+        "rss",
+        "wechat_search",
+        "xiaohongshu:feed",
+        "weibo_hot",
+    ]
+    ordered = [k for k in priority if k in buckets] + [k for k in buckets if k not in priority]
+    picked: List[Dict[str, Any]] = []
+    idx_map = {k: 0 for k in ordered}
+    while len(picked) < limit:
+        progressed = False
+        for k in ordered:
+            if len(picked) >= limit:
+                break
+            arr = buckets[k]
+            i = idx_map[k]
+            if i < len(arr):
+                picked.append(arr[i])
+                idx_map[k] = i + 1
+                progressed = True
+        if not progressed:
+            break
+    return picked
+
+
+def refresh_topics(max_new: int = 16) -> Dict[str, Any]:
     """Query Expansion -> 多源抓取 -> 去重与预匹配 -> 多源共振 -> LLM(is_real+打分+翻写) -> 入库。"""
     account = db.get_primary_account()
     sc = account.get("sources_config") or {}
@@ -630,24 +751,21 @@ def refresh_topics(max_new: int = 8) -> Dict[str, Any]:
         })
     annotated = annotate_cross_source_resonance(annotated)
     annotated = cluster_candidates(annotated)
-    # 优先把低粉爆款、跨源共振、命中关键词、高热度候选排在前面送入模型
-    annotated.sort(
-        key=lambda x: (
-            bool(x.get("metrics_badge")),
-            len(x.get("resonance_sources") or []) >= 2,
-            len(x.get("matched_terms") or []) > 0,
-            int(x.get("popularity") or 0),
-        ),
-        reverse=True,
-    )
+    sampled = _select_balanced_topic_candidates(annotated, limit=max(28, max_new * 2))
 
-    scored = _score_and_rewrite_with_llm(annotated, account, top_n=max_new)
+    scored = _score_and_rewrite_with_llm(sampled, account, top_n=max_new)
     mode = "llm"
     if scored is None:
         mode = "heuristic"
-        scored = [_heuristic_score_item(it, account) for it in annotated]
+        scored = [_heuristic_score_item(it, account) for it in sampled]
         scored.sort(key=lambda x: x["score"], reverse=True)
         scored = scored[:max_new]
+
+    # 方案 A：仅对最终精选入池的小红书选题补全点赞/收藏/评论与正文摘要，避免全量抓详情触发风控
+    try:
+        sources.enrich_xiaohongshu_items(scored, mode=str(sc.get("xhs_mode") or "auto"), max_items=5)
+    except Exception:
+        pass
 
     inserted: List[Dict[str, Any]] = []
     for item in scored:
@@ -661,6 +779,8 @@ def refresh_topics(max_new: int = 8) -> Dict[str, Any]:
             "suggested_titles": item.get("suggested_titles") or [],
             "raw_signals": item.get("raw_signals") or [],
             "metrics_badge": item.get("metrics_badge") or "",
+            "engagement_badge": item.get("engagement_badge") or "",
+            "engagement": item.get("engagement") or {},
             "angle": item.get("angle") or "",
             "reason": item.get("reason") or "",
             "category": item.get("category") or "周二实操",
@@ -692,6 +812,42 @@ def refresh_topics(max_new: int = 8) -> Dict[str, Any]:
         "errors": gathered["errors"],
         "topics": inserted,
     }
+
+
+def enrich_topic_engagement(topic_id: str) -> Dict[str, Any]:
+    """按需为单条小红书选题补全点赞/收藏/评论与笔记正文（用于历史存量选题或一键写爆款前补全）。"""
+    tp = db.get_topic(topic_id)
+    if not tp:
+        raise ValueError("选题不存在")
+    url = str(tp.get("source_url") or "").strip()
+    if not url or tp.get("source_type") != "xiaohongshu":
+        return tp
+    sc = (db.get_primary_account().get("sources_config") or {})
+    detail = sources.fetch_xiaohongshu_note_detail(
+        url,
+        mode=str(sc.get("xhs_mode") or "auto"),
+        use_cache=False,
+    )
+    if not detail:
+        raise RuntimeError("未能获取该笔记详情，请确认小红书已登录且链接未失效")
+    cur_eng = tp.get("engagement") if isinstance(tp.get("engagement"), dict) else {}
+    likes = max(int(cur_eng.get("likes") or 0), int(detail.get("likes") or 0))
+    collects = max(int(cur_eng.get("collects") or 0), int(detail.get("collects") or 0))
+    comments = max(int(cur_eng.get("comments") or 0), int(detail.get("comments") or 0))
+    badge = sources._format_xhs_engagement_badge(likes, collects, comments)
+    content = str(detail.get("content") or "").replace("\r", " ").strip()
+    raw_summary = tp.get("raw_summary") or ""
+    if content:
+        raw_summary = (f"{badge} · " if badge else "") + sources.trim_clean(content, 240)
+    elif badge and "👍" not in raw_summary:
+        raw_summary = f"{badge} · {raw_summary}".strip(" ·")
+    updated = db.update_topic(
+        topic_id,
+        engagement={"likes": likes, "collects": collects, "comments": comments},
+        engagement_badge=badge or tp.get("engagement_badge") or "",
+        raw_summary=raw_summary,
+    )
+    return updated or tp
 
 
 def create_manual_topic(idea: str, source_url: str = "") -> Dict[str, Any]:

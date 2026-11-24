@@ -36,7 +36,7 @@ def classify_credibility(item: Dict[str, Any]) -> str:
             return "一手官方"
     if len(res_srcs) >= 2 or len({str(s.get("source_type") or "") for s in sigs if s.get("source_type")}) >= 2:
         return "多源印证"
-    if st in ("hackernews", "bilibili", "reddit", "bluesky", "x") or any(
+    if st in ("hackernews", "bilibili", "reddit", "bluesky", "x", "xiaohongshu") or any(
         k in sn for k in ("simon willison", "latent space", "少数派", "阮一峰")
     ):
         return "社区热议"
@@ -155,6 +155,8 @@ def _select_balanced_clusters(clustered: List[Dict[str, Any]], limit: int) -> Li
         sn = str(x.get("source_name") or "")
         if st == "rss":
             return f"rss:{sn}"
+        if st == "xiaohongshu":
+            return "xiaohongshu:hot" if sn.startswith("小红书热搜") else "xiaohongshu:feed"
         return st or sn or "other"
 
     buckets: Dict[str, List[Dict[str, Any]]] = {}
@@ -182,10 +184,15 @@ def _select_balanced_clusters(clustered: List[Dict[str, Any]], limit: int) -> Li
         "rss:Hugging Face Blog",
         "rss:Latent Space (AINews)",
         "rss:Simon Willison",
+        "x",
+        "xiaohongshu:hot",
         "github_trending",
         "hf_papers",
         "hackernews",
+        "reddit",
+        "bluesky",
         "bilibili",
+        "xiaohongshu:feed",
         "wechat_search",
         "rss:少数派",
         "rss:阮一峰的网络日志",
@@ -240,6 +247,10 @@ def refresh_intel_stream(limit: int = 36) -> Dict[str, Any]:
     clustered = topic_engine.cluster_candidates(annotated)
 
     picked = _select_balanced_clusters(clustered, max(1, min(limit, 50)))
+    try:
+        sources.enrich_xiaohongshu_items(picked, mode=str(sc.get("xhs_mode") or "auto"), max_items=5)
+    except Exception:
+        pass
 
     llm_map = _summarize_batch_with_llm(picked)
     mode = "llm" if llm_map else "rules"
@@ -267,6 +278,8 @@ def refresh_intel_stream(limit: int = 36) -> Dict[str, Any]:
             "signals": it.get("raw_signals") or [],
             "credibility": cred,
             "metrics_badge": str(it.get("metrics_badge") or ""),
+            "engagement_badge": str(it.get("engagement_badge") or ""),
+            "engagement": it.get("engagement") if isinstance(it.get("engagement"), dict) else {},
             "category": cat,
             "tags": tags[:4],
             "popularity": int(it.get("popularity") or 0),
@@ -323,6 +336,8 @@ def promote_intel_to_topic(intel_id: str) -> Dict[str, Any]:
         "suggested_titles": suggested[:3],
         "raw_signals": sigs,
         "metrics_badge": item.get("metrics_badge") or "",
+        "engagement_badge": item.get("engagement_badge") or "",
+        "engagement": item.get("engagement") if isinstance(item.get("engagement"), dict) else {},
         "angle": angle,
         "reason": reason,
         "category": item.get("category") or "AI快讯",

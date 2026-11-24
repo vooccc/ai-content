@@ -65,6 +65,10 @@ DEFAULT_ACCOUNT_SEED: Dict[str, Any] = {
         "x_search_enabled": True,
         "x_search_keywords": ["AI Agent", "Claude Code", "OpenAI", "LLM"],
         "x_min_faves": 100,
+        "xiaohongshu": True,
+        "xhs_mode": "xhshow",
+        "xhs_category": "homefeed.career_v3",
+        "xhs_keywords": ["AI工具", "AI Agent", "一人公司"],
         "bilibili": True,
         "bilibili_accounts": [],
         "weibo_hot": True,
@@ -216,6 +220,15 @@ def ensure_db() -> None:
                 conn.execute("ALTER TABLE topics ADD COLUMN raw_signals_json TEXT NOT NULL DEFAULT '[]'")
             if "metrics_badge" not in existing_cols:
                 conn.execute("ALTER TABLE topics ADD COLUMN metrics_badge TEXT NOT NULL DEFAULT ''")
+            if "engagement_badge" not in existing_cols:
+                conn.execute("ALTER TABLE topics ADD COLUMN engagement_badge TEXT NOT NULL DEFAULT ''")
+            if "engagement_json" not in existing_cols:
+                conn.execute("ALTER TABLE topics ADD COLUMN engagement_json TEXT NOT NULL DEFAULT '{}'")
+            intel_cols = {r["name"] for r in conn.execute("PRAGMA table_info(intel_items)").fetchall()}
+            if "engagement_badge" not in intel_cols:
+                conn.execute("ALTER TABLE intel_items ADD COLUMN engagement_badge TEXT NOT NULL DEFAULT ''")
+            if "engagement_json" not in intel_cols:
+                conn.execute("ALTER TABLE intel_items ADD COLUMN engagement_json TEXT NOT NULL DEFAULT '{}'")
             now = time.time()
             cur = conn.execute("SELECT id FROM accounts WHERE id = ?", (DEFAULT_ACCOUNT_ID,))
             if not cur.fetchone():
@@ -369,6 +382,8 @@ def _row_to_topic(row: sqlite3.Row) -> Dict[str, Any]:
         "suggested_titles": _parse_json(d.get("suggested_titles_json"), []),
         "raw_signals": _parse_json(d.get("raw_signals_json"), []),
         "metrics_badge": d.get("metrics_badge") or "",
+        "engagement_badge": d.get("engagement_badge") or "",
+        "engagement": _parse_json(d.get("engagement_json"), {}),
         "angle": d["angle"],
         "reason": d["reason"],
         "category": d["category"],
@@ -402,8 +417,12 @@ def list_topics(
         clauses.append("status = ?")
         params.append(status)
     if source_type:
-        clauses.append("source_type = ?")
-        params.append(source_type)
+        clauses.append("(source_type = ? OR raw_signals_json LIKE ? OR raw_signals_json LIKE ?)")
+        params.extend([
+            source_type,
+            f'%"source_type": "{source_type}"%',
+            f'%"source_type":"{source_type}"%',
+        ])
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"SELECT * FROM topics {where} ORDER BY score DESC, created_at DESC LIMIT ?"
     params.append(max(1, min(limit, 300)))
@@ -433,12 +452,25 @@ def topic_funnel_counts() -> Dict[str, int]:
 
 
 def topic_source_counts() -> Dict[str, int]:
-    """统计选题池内各 source_type 有效条目数（不含已忽略）。"""
+    """统计选题池内各 source_type 有效条目数（含聚簇折叠信号，不含已忽略）。"""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT source_type, COUNT(*) AS cnt FROM topics WHERE status != 'ignored' GROUP BY source_type"
+            "SELECT source_type, raw_signals_json FROM topics WHERE status != 'ignored'"
         ).fetchall()
-    return {str(r["source_type"] or ""): int(r["cnt"] or 0) for r in rows}
+    counts: Dict[str, int] = {}
+    for r in rows:
+        seen = set()
+        st = str(r["source_type"] or "").strip()
+        if st:
+            seen.add(st)
+        for s in _parse_json(r["raw_signals_json"], []):
+            if isinstance(s, dict):
+                sst = str(s.get("source_type") or "").strip()
+                if sst:
+                    seen.add(sst)
+        for k in seen:
+            counts[k] = counts.get(k, 0) + 1
+    return counts
 
 
 def get_topic(topic_id: str) -> Optional[Dict[str, Any]]:
@@ -456,16 +488,19 @@ def insert_topic(item: Dict[str, Any]) -> Dict[str, Any]:
     signals = item.get("raw_signals") or []
     if not isinstance(signals, list):
         signals = []
+    engagement = item.get("engagement") or {}
+    if not isinstance(engagement, dict):
+        engagement = {}
     with get_conn() as conn:
         conn.execute(
             """
             INSERT INTO topics (
                 id, account_id, source_type, source_name, source_url,
                 raw_title, raw_summary, suggested_titles_json,
-                raw_signals_json, metrics_badge,
+                raw_signals_json, metrics_badge, engagement_badge, engagement_json,
                 angle, reason, category, score, status, project_id,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 tid,
@@ -478,6 +513,8 @@ def insert_topic(item: Dict[str, Any]) -> Dict[str, Any]:
                 json.dumps(titles, ensure_ascii=False),
                 json.dumps(signals, ensure_ascii=False),
                 str(item.get("metrics_badge") or "").strip(),
+                str(item.get("engagement_badge") or "").strip(),
+                json.dumps(engagement, ensure_ascii=False),
                 str(item.get("angle") or "").strip(),
                 str(item.get("reason") or "").strip(),
                 str(item.get("category") or "实操教程").strip(),
@@ -492,7 +529,7 @@ def insert_topic(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def update_topic(topic_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
-    allowed = {"status", "project_id", "score", "angle", "reason", "category"}
+    allowed = {"status", "project_id", "score", "angle", "reason", "category", "raw_summary", "engagement_badge"}
     updates: List[str] = []
     params: List[Any] = []
     for k, v in fields.items():
@@ -502,6 +539,9 @@ def update_topic(topic_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
     if "suggested_titles" in fields:
         updates.append("suggested_titles_json = ?")
         params.append(json.dumps(fields["suggested_titles"], ensure_ascii=False))
+    if "engagement" in fields:
+        updates.append("engagement_json = ?")
+        params.append(json.dumps(fields["engagement"] or {}, ensure_ascii=False))
     if not updates:
         return get_topic(topic_id)
     updates.append("updated_at = ?")
@@ -683,6 +723,8 @@ def _row_to_intel(row: sqlite3.Row) -> Dict[str, Any]:
         "signals": _parse_json(d.get("signals_json"), []),
         "credibility": d["credibility"],
         "metrics_badge": d["metrics_badge"],
+        "engagement_badge": d.get("engagement_badge") or "",
+        "engagement": _parse_json(d.get("engagement_json"), {}),
         "category": d["category"],
         "tags": _parse_json(d.get("tags_json"), []),
         "popularity": int(d["popularity"] or 0),
@@ -705,6 +747,8 @@ def upsert_intel_items(items: List[Dict[str, Any]]) -> Dict[str, int]:
             existing = conn.execute("SELECT * FROM intel_items WHERE cluster_key = ?", (ckey,)).fetchone()
             sigs = it.get("signals") or []
             tags = it.get("tags") or []
+            eng_obj = it.get("engagement") if isinstance(it.get("engagement"), dict) else {}
+            eng_badge = str(it.get("engagement_badge") or "").strip()
             if existing:
                 old_sigs = _parse_json(existing["signals_json"], [])
                 seen_urls = {(s.get("url") or "", s.get("title") or "") for s in old_sigs}
@@ -714,12 +758,15 @@ def upsert_intel_items(items: List[Dict[str, Any]]) -> Dict[str, int]:
                     if k not in seen_urls:
                         seen_urls.add(k)
                         merged_sigs.append(s)
+                old_eng = _parse_json(existing["engagement_json"] if "engagement_json" in existing.keys() else "{}", {})
+                merged_eng = eng_obj if eng_obj else old_eng
+                merged_eng_badge = eng_badge or str(existing["engagement_badge"] if "engagement_badge" in existing.keys() else "")
                 conn.execute(
                     """
                     UPDATE intel_items SET
                         title = ?, summary = ?, signals_json = ?,
-                        credibility = ?, metrics_badge = ?, category = ?,
-                        tags_json = ?, popularity = ?, updated_at = ?
+                        credibility = ?, metrics_badge = ?, engagement_badge = ?, engagement_json = ?,
+                        category = ?, tags_json = ?, popularity = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
@@ -728,6 +775,8 @@ def upsert_intel_items(items: List[Dict[str, Any]]) -> Dict[str, int]:
                         json.dumps(merged_sigs, ensure_ascii=False),
                         str(it.get("credibility") or existing["credibility"]),
                         str(it.get("metrics_badge") or existing["metrics_badge"]),
+                        merged_eng_badge,
+                        json.dumps(merged_eng, ensure_ascii=False),
                         str(it.get("category") or existing["category"]),
                         json.dumps(tags or _parse_json(existing["tags_json"], []), ensure_ascii=False),
                         max(int(it.get("popularity") or 0), int(existing["popularity"] or 0)),
@@ -743,9 +792,9 @@ def upsert_intel_items(items: List[Dict[str, Any]]) -> Dict[str, int]:
                     INSERT INTO intel_items (
                         id, cluster_key, title, summary, raw_title,
                         source_type, source_name, source_url, signals_json,
-                        credibility, metrics_badge, category, tags_json,
-                        popularity, promoted_topic_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        credibility, metrics_badge, engagement_badge, engagement_json,
+                        category, tags_json, popularity, promoted_topic_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         iid,
@@ -759,6 +808,8 @@ def upsert_intel_items(items: List[Dict[str, Any]]) -> Dict[str, int]:
                         json.dumps(sigs, ensure_ascii=False),
                         str(it.get("credibility") or "社区热议"),
                         str(it.get("metrics_badge") or ""),
+                        eng_badge,
+                        json.dumps(eng_obj, ensure_ascii=False),
                         str(it.get("category") or "AI快讯"),
                         json.dumps(tags, ensure_ascii=False),
                         int(it.get("popularity") or 0),
@@ -783,8 +834,12 @@ def list_intel_items(
         clauses.append("credibility = ?")
         params.append(credibility)
     if source_type:
-        clauses.append("(source_type = ? OR signals_json LIKE ?)")
-        params.extend([source_type, f'%"{source_type}"%'])
+        clauses.append("(source_type = ? OR signals_json LIKE ? OR signals_json LIKE ?)")
+        params.extend([
+            source_type,
+            f'%"source_type": "{source_type}"%',
+            f'%"source_type":"{source_type}"%',
+        ])
     if q.strip():
         like = f"%{q.strip()}%"
         clauses.append("(title LIKE ? OR summary LIKE ? OR raw_title LIKE ? OR tags_json LIKE ?)")
@@ -819,4 +874,28 @@ def intel_counts() -> Dict[str, int]:
         c = str(r["credibility"] or "")
         if c in counts:
             counts[c] += 1
+    return counts
+
+
+def intel_source_counts() -> Dict[str, int]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT source_type, signals_json FROM intel_items").fetchall()
+    counts: Dict[str, int] = {}
+    for r in rows:
+        seen = set()
+        st = str(r["source_type"] or "").strip()
+        if st:
+            seen.add(st)
+        try:
+            sigs = json.loads(r["signals_json"] or "[]")
+            if isinstance(sigs, list):
+                for s in sigs:
+                    if isinstance(s, dict):
+                        sst = str(s.get("source_type") or "").strip()
+                        if sst:
+                            seen.add(sst)
+        except Exception:
+            pass
+        for k in seen:
+            counts[k] = counts.get(k, 0) + 1
     return counts

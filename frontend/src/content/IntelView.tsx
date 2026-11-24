@@ -21,6 +21,8 @@ interface IntelItem {
   signals: IntelSignal[]
   credibility: string
   metrics_badge: string
+  engagement_badge?: string
+  engagement?: { likes?: number; collects?: number; comments?: number }
   category: string
   tags: string[]
   popularity: number
@@ -50,10 +52,26 @@ const CRED_COLORS: Record<string, { bg: string; border: string; text: string }> 
   快讯转述: { bg: 'rgba(127,127,127,0.12)', border: 'rgba(127,127,127,0.3)', text: 'inherit' },
 }
 
+const INTEL_SOURCE_OPTIONS: { key: string; label: string }[] = [
+  { key: 'x', label: 'X (Twitter)' },
+  { key: 'xiaohongshu', label: '小红书' },
+  { key: 'github_trending', label: 'GitHub Trending' },
+  { key: 'hackernews', label: 'Hacker News' },
+  { key: 'hf_papers', label: 'Hugging Face 论文' },
+  { key: 'reddit', label: 'Reddit' },
+  { key: 'bluesky', label: 'Bluesky' },
+  { key: 'bilibili', label: 'B站视频' },
+  { key: 'wechat_search', label: '搜狗微信' },
+  { key: 'weibo_hot', label: '微博热搜' },
+  { key: 'rss', label: '科技 RSS' },
+]
+
 export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps) {
   const [items, setItems] = useState<IntelItem[]>([])
   const [counts, setCounts] = useState<IntelCounts>({ all: 0, 一手官方: 0, 多源印证: 0, 社区热议: 0, 快讯转述: 0 })
+  const [sourceCounts, setSourceCounts] = useState<Record<string, number>>({})
   const [cred, setCred] = useState<CredFilter>('all')
+  const [sourceType, setSourceType] = useState('')
   const [query, setQuery] = useState('')
   const [loading, setLoading] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
@@ -62,11 +80,12 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [msg, setMsg] = useState('')
 
-  async function loadIntel(curCred = cred, curQ = query) {
+  async function loadIntel(curCred = cred, curQ = query, curSrc = sourceType) {
     setLoading(true)
     try {
       const p = new URLSearchParams()
       if (curCred !== 'all') p.set('credibility', curCred)
+      if (curSrc) p.set('source_type', curSrc)
       if (curQ.trim()) p.set('q', curQ.trim())
       const qs = p.toString() ? `?${p.toString()}` : ''
       const res = await fetch(`${API_BASE}/intel${qs}`)
@@ -74,6 +93,7 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
       if (d.ok) {
         setItems(d.items || [])
         if (d.counts) setCounts(d.counts)
+        if (d.source_counts) setSourceCounts(d.source_counts)
       }
     } catch (e) {
       setMsg(`加载快讯失败：${e}`)
@@ -83,8 +103,8 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
   }
 
   useEffect(() => {
-    loadIntel(cred, query)
-  }, [cred])
+    loadIntel(cred, query, sourceType)
+  }, [cred, sourceType])
 
   async function refreshNow() {
     setRefreshing(true)
@@ -93,13 +113,13 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
       const res = await fetch(`${API_BASE}/intel/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ limit: 36 }),
+        body: JSON.stringify({ limit: 48 }),
       })
       const d = await res.json()
       if (d.ok) {
         const errTip = d.errors?.length ? `（部分源告警：${d.errors[0]}）` : ''
         setMsg(`✓ 采集 ${d.fetched} 条，聚簇为 ${d.clustered} 起事件，新增 ${d.added} / 更新 ${d.updated}（${d.mode === 'llm' ? 'AI提炼' : '规则模式'}）${errTip}`)
-        await loadIntel(cred, query)
+        await loadIntel(cred, query, sourceType)
       } else {
         setMsg(`✗ 刷新失败：${d.error || '未知错误'}`)
       }
@@ -118,7 +138,7 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
       const d = await res.json()
       if (d.ok) {
         setMsg(`✓ 已翻译 ${d.translated} 条英文快讯${d.remaining > 0 ? `（剩余 ${d.remaining} 条可再点一次）` : '，已全部中文化'}`)
-        await loadIntel(cred, query)
+        await loadIntel(cred, query, sourceType)
       } else {
         setMsg(`✗ 翻译失败：${d.error || '未知错误'}`)
       }
@@ -209,12 +229,33 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
             {label} <span style={{ opacity: 0.65 }}>({cnt})</span>
           </button>
         ))}
+        <select
+          value={sourceType}
+          onChange={(e) => setSourceType(e.target.value)}
+          title="按信息源单独筛选快讯"
+          style={{
+            padding: '5px 9px',
+            borderRadius: 8,
+            fontSize: 12.5,
+            border: sourceType ? '1px solid rgba(90,169,230,0.85)' : '1px solid rgba(127,127,127,0.25)',
+            background: sourceType ? 'rgba(90,169,230,0.14)' : 'transparent',
+            color: 'inherit',
+            colorScheme: 'light dark',
+          }}
+        >
+          <option value="">全部来源</option>
+          {INTEL_SOURCE_OPTIONS.filter((opt) => (sourceCounts[opt.key] || 0) > 0 || opt.key === 'xiaohongshu' || opt.key === 'x').map((opt) => (
+            <option key={opt.key} value={opt.key}>
+              {opt.label} ({sourceCounts[opt.key] || 0})
+            </option>
+          ))}
+        </select>
 
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') loadIntel(cred, query) }}
+            onKeyDown={(e) => { if (e.key === 'Enter') loadIntel(cred, query, sourceType) }}
             placeholder="搜关键词（如 Claude / Agent）"
             style={{
               padding: '6px 10px',
@@ -226,7 +267,7 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
               width: 190,
             }}
           />
-          <button type="button" style={ghostBtn} onClick={() => loadIntel(cred, query)}>
+          <button type="button" style={ghostBtn} onClick={() => loadIntel(cred, query, sourceType)}>
             搜索
           </button>
           {items.some((x) => !/[\u4e00-\u9fff]/.test(x.title || '')) && (
@@ -259,12 +300,16 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
 
       {!loading && items.length === 0 && (
         <div style={{ ...card, textAlign: 'center', padding: 36, opacity: 0.8 }}>
-          <div style={{ fontSize: 15, marginBottom: 8 }}>还没有拉取实时快讯</div>
+          <div style={{ fontSize: 15, marginBottom: 8 }}>
+            {sourceType || cred !== 'all' || query.trim() ? '当前筛选条件下暂无快讯' : '还没有拉取实时快讯'}
+          </div>
           <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 14 }}>
-            点击右上角「🔄 刷新快讯」，会并发拉取 OpenAI / DeepMind / HuggingFace / GitHub / HN / B站 / RSS 等一手动态并自动聚簇翻成中文快讯。
+            {sourceType || cred !== 'all' || query.trim()
+              ? '可切换回「全部来源」或点右上角「🔄 刷新快讯」采集该信源最新动态。'
+              : '点击右上角「🔄 刷新快讯」，会并发拉取 OpenAI / DeepMind / HuggingFace / GitHub / HN / B站 / X / 小红书 / RSS 等一手动态并自动聚簇翻成中文快讯。'}
           </div>
           <button type="button" style={goBtn} disabled={refreshing} onClick={refreshNow}>
-            立即采集第一批快讯
+            {sourceType ? '刷新全部快讯' : '立即采集第一批快讯'}
           </button>
         </div>
       )}
@@ -304,6 +349,21 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
                   }}
                 >
                   🚀 {it.metrics_badge}
+                </span>
+              )}
+              {it.engagement_badge && (
+                <span
+                  title="小红书互动数据（点赞 · 收藏 · 评论）"
+                  style={{
+                    fontSize: 11.5,
+                    fontWeight: 600,
+                    padding: '2px 8px',
+                    borderRadius: 6,
+                    background: 'rgba(218,165,32,0.14)',
+                    color: '#c48f16',
+                  }}
+                >
+                  {it.engagement_badge}
                 </span>
               )}
               {sigs.length > 1 && (

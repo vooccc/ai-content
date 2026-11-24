@@ -20,6 +20,8 @@ interface TopicItem {
   suggested_titles: string[]
   raw_signals?: RawSignal[]
   metrics_badge?: string
+  engagement_badge?: string
+  engagement?: { likes?: number; collects?: number; comments?: number }
   angle: string
   reason: string
   category: string
@@ -76,6 +78,10 @@ interface SourcesConfig {
   x_search_enabled?: boolean
   x_search_keywords?: string[]
   x_min_faves?: number
+  xiaohongshu?: boolean
+  xhs_mode?: 'xhshow' | 'opencli' | 'auto'
+  xhs_category?: string
+  xhs_keywords?: string[]
   bilibili?: boolean
   bilibili_accounts?: string[]
   weibo_hot?: boolean
@@ -101,6 +107,7 @@ const SOURCE_META: { key: string; cfgKey?: keyof SourcesConfig; label: string; d
   { key: 'reddit', cfgKey: 'reddit', label: 'Reddit AI 社区', desc: 'Arctic Shift 免 Key 热帖' },
   { key: 'bluesky', cfgKey: 'bluesky', label: 'Bluesky 大牛', desc: '免 Key 关注 AI 研究者动态' },
   { key: 'x', cfgKey: 'x', label: 'X (Twitter)', desc: '关注流 / List + 热门破圈搜索' },
+  { key: 'xiaohongshu', cfgKey: 'xiaohongshu', label: '小红书', desc: 'xhshow / OpenCLI 双引擎热门' },
   { key: 'bilibili', cfgKey: 'bilibili', label: 'B站视频', desc: '关键词 + UP主 + 低粉爆款' },
   { key: 'wechat_search', cfgKey: 'wechat_search', label: '搜狗公众号', desc: '微信生态同题文章' },
   { key: 'weibo_hot', cfgKey: 'weibo_hot', label: '微博热搜', desc: 'AI/科技破圈话题' },
@@ -108,8 +115,6 @@ const SOURCE_META: { key: string; cfgKey?: keyof SourcesConfig; label: string; d
   { key: 'manual', label: '灵感投喂', desc: '手动输入想法或链接' },
   { key: 'import', label: '清单导入', desc: 'CSV / 表格批量导入' },
 ]
-
-const SOURCE_LABEL_MAP: Record<string, string> = Object.fromEntries(SOURCE_META.map((s) => [s.key, s.label]))
 
 export default function TopicsView({ onOpenProject }: TopicsViewProps) {
   const [topics, setTopics] = useState<TopicItem[]>([])
@@ -140,6 +145,13 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
   const [xMinFaves, setXMinFaves] = useState(100)
   const [newXKw, setNewXKw] = useState('')
   const [xTestRes, setXTestRes] = useState<{ ok: boolean; text: string } | null>(null)
+  const [xhsAuthState, setXhsAuthState] = useState<{ has_xhs_cookie?: boolean; xhs_cookie_masked?: string; opencli_installed?: boolean; opencli_extension_connected?: boolean }>({})
+  const [xhsCookie, setXhsCookie] = useState('')
+  const [xhsMode, setXhsMode] = useState<'xhshow' | 'opencli' | 'auto'>('xhshow')
+  const [xhsCategory, setXhsCategory] = useState('homefeed.career_v3')
+  const [xhsKeywords, setXhsKeywords] = useState<string[]>(['AI工具', 'AI Agent', '一人公司'])
+  const [newXhsKw, setNewXhsKw] = useState('')
+  const [xhsTestRes, setXhsTestRes] = useState<{ ok: boolean; text: string } | null>(null)
   const [newRssName, setNewRssName] = useState('')
   const [newRssUrl, setNewRssUrl] = useState('')
   const [rssTestRes, setRssTestRes] = useState<{ ok: boolean; text: string } | null>(null)
@@ -151,6 +163,7 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
   const [importText, setImportText] = useState('')
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null)
   const [importBusy, setImportBusy] = useState(false)
+  const [enrichingId, setEnrichingId] = useState('')
   const [msg, setMsg] = useState('')
 
   async function loadSources() {
@@ -166,6 +179,10 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
         setXSearchKeywords(Array.isArray(sc.x_search_keywords) && sc.x_search_keywords.length > 0 ? sc.x_search_keywords : ['AI Agent', 'Claude Code', 'OpenAI', 'LLM'])
         setXMinFaves(typeof sc.x_min_faves === 'number' && sc.x_min_faves >= 10 ? sc.x_min_faves : 100)
         if (d.x_auth) setXAuthState(d.x_auth)
+        setXhsMode(sc.xhs_mode === 'opencli' || sc.xhs_mode === 'auto' ? sc.xhs_mode : 'xhshow')
+        setXhsCategory(sc.xhs_category || 'homefeed.career_v3')
+        setXhsKeywords(Array.isArray(sc.xhs_keywords) && sc.xhs_keywords.length > 0 ? sc.xhs_keywords : ['AI工具', 'AI Agent', '一人公司'])
+        if (d.xhs_auth) setXhsAuthState(d.xhs_auth)
         if (d.pool_counts) setSourceCounts(d.pool_counts)
       }
     } catch { /* ignore */ }
@@ -241,7 +258,7 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
       const res = await fetch(`${API_BASE}/topics/refresh`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ max_new: 8 }),
+        body: JSON.stringify({ max_new: 16 }),
       })
       const d = await res.json().catch(() => ({}))
       if (res.ok && d.ok) {
@@ -256,6 +273,25 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
       setMsg(`✗ 抓取失败：${e}`)
     } finally {
       setRefreshing(false)
+    }
+  }
+
+  async function enrichTopic(t: TopicItem) {
+    if (enrichingId) return
+    setEnrichingId(t.id)
+    try {
+      const res = await fetch(`${API_BASE}/topics/${t.id}/enrich`, { method: 'POST' })
+      const d = await res.json().catch(() => ({}))
+      if (res.ok && d.ok && d.topic) {
+        setTopics((prev) => prev.map((x) => (x.id === t.id ? d.topic : x)))
+        setMsg(`✓ 已补全互动数据与笔记正文：${d.topic.engagement_badge || '完成'}`)
+      } else {
+        setMsg(`✗ 补全失败：${d.error || `HTTP ${res.status}`}`)
+      }
+    } catch (e) {
+      setMsg(`✗ 补全失败：${e}`)
+    } finally {
+      setEnrichingId('')
     }
   }
 
@@ -518,6 +554,7 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
     (srcCfg.reddit !== false ? 1 : 0) +
     (srcCfg.bluesky !== false ? 1 : 0) +
     (srcCfg.x !== false && xAuthState.has_x_auth_token && xAuthState.has_x_ct0 ? 1 : 0) +
+    (srcCfg.xiaohongshu !== false && (xhsAuthState.has_xhs_cookie || xhsAuthState.opencli_installed) ? 1 : 0) +
     (srcCfg.bilibili !== false ? 1 : 0) +
     (srcCfg.wechat_search !== false ? 1 : 0) +
     (srcCfg.weibo_hot !== false ? 1 : 0) +
@@ -569,16 +606,29 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
             {label} <span style={{ opacity: 0.65 }}>({cnt})</span>
           </button>
         ))}
-        {sourceFilter && (
-          <button
-            type="button"
-            style={{ ...pillBtn(true), borderColor: 'rgba(90,169,230,0.8)', background: 'rgba(90,169,230,0.14)' }}
-            onClick={() => setSourceFilter('')}
-            title="点击取消来源筛选"
-          >
-            来源：{SOURCE_LABEL_MAP[sourceFilter] || sourceFilter} ×
-          </button>
-        )}
+        <select
+          value={sourceFilter}
+          onChange={(e) => setSourceFilter(e.target.value)}
+          title="按平台来源单独筛选选题"
+          style={{
+            ...inputStyle,
+            width: 'auto',
+            minWidth: 112,
+            padding: '4px 8px',
+            fontSize: 12.5,
+            borderRadius: 999,
+            borderColor: sourceFilter ? 'rgba(90,169,230,0.8)' : 'rgba(127,127,127,0.28)',
+            background: sourceFilter ? 'rgba(90,169,230,0.14)' : 'transparent',
+            colorScheme: 'light dark',
+          }}
+        >
+          <option value="">全部来源</option>
+          {SOURCE_META.filter((sm) => (sourceCounts[sm.key] || 0) > 0 || sm.key === 'xiaohongshu' || sm.key === 'x').map((sm) => (
+            <option key={sm.key} value={sm.key}>
+              {sm.label} ({sourceCounts[sm.key] || 0})
+            </option>
+          ))}
+        </select>
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <button
             type="button"
@@ -1065,6 +1115,215 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
             )}
           </div>
 
+          <div style={{ padding: '10px 12px', borderRadius: 9, background: 'rgba(127,127,127,0.05)', marginBottom: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6, flexWrap: 'wrap', gap: 8 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>
+                小红书（Xiaohongshu）双引擎订阅
+                {xhsAuthState.has_xhs_cookie ? (
+                  <span style={{ marginLeft: 8, fontSize: 11.5, color: '#3a9d5d', fontWeight: 500 }}>
+                    ✓ Cookie 已保存（{xhsAuthState.xhs_cookie_masked}）
+                  </span>
+                ) : (
+                  <span style={{ marginLeft: 8, fontSize: 11.5, opacity: 0.6, fontWeight: 400 }}>
+                    未配 Cookie
+                  </span>
+                )}
+                <span style={{ marginLeft: 8, fontSize: 11.5, color: xhsAuthState.opencli_extension_connected ? '#3a9d5d' : undefined, opacity: xhsAuthState.opencli_extension_connected ? 1 : 0.72, fontWeight: 400 }}>
+                  · OpenCLI：{!xhsAuthState.opencli_installed ? '未检测到' : (xhsAuthState.opencli_extension_connected ? '✓ 扩展已连接' : '已装 CLI（待连 Chrome 扩展）')}
+                </span>
+              </div>
+              <span style={{ fontSize: 11.5, opacity: 0.6 }}>
+                两种模式可随时切换测试对比稳定性
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
+              <select
+                value={xhsMode}
+                onChange={(e) => {
+                  const v = e.target.value
+                  setXhsMode(v === 'opencli' || v === 'auto' ? v : 'xhshow')
+                  setXhsTestRes(null)
+                }}
+                style={{ ...inputStyle, minWidth: 215, width: 'auto', padding: '5px 8px', fontSize: 12.5, colorScheme: 'light dark' }}
+              >
+                <option value="xhshow">引擎 1：xhshow 纯算直连（需 Cookie）</option>
+                <option value="opencli">引擎 2：OpenCLI 浏览器桥接（免算签名）</option>
+                <option value="auto">自动：OpenCLI 优先，不可用切 xhshow</option>
+              </select>
+              {xhsMode !== 'opencli' && (
+                <select
+                  value={xhsCategory}
+                  onChange={(e) => setXhsCategory(e.target.value)}
+                  style={{ ...inputStyle, minWidth: 135, width: 'auto', padding: '5px 8px', fontSize: 12.5, colorScheme: 'light dark' }}
+                >
+                  <option value="homefeed.career_v3">职场</option>
+                  <option value="homefeed_recommend">首页推荐</option>
+                  <option value="homefeed.gaming_v3">游戏</option>
+                  <option value="homefeed.movie_and_tv_v3">影视</option>
+                  <option value="homefeed.household_product_v3">家居</option>
+                  <option value="homefeed.travel_v3">旅行</option>
+                  <option value="homefeed.love_v3">情感</option>
+                  <option value="homefeed.fashion_v3">穿搭</option>
+                  <option value="homefeed.food_v3">美食</option>
+                  <option value="homefeed.cosmetics_v3">彩妆</option>
+                  <option value="homefeed.fitness_v3">健身</option>
+                  <option value="homefeed.video_v3">视频</option>
+                </select>
+              )}
+              {xhsMode !== 'opencli' && (
+                <input
+                  type="password"
+                  value={xhsCookie}
+                  onChange={(e) => { setXhsCookie(e.target.value); setXhsTestRes(null) }}
+                  placeholder={xhsAuthState.has_xhs_cookie ? `Cookie（已配：${xhsAuthState.xhs_cookie_masked}，留空沿用）` : '粘贴小红书 Cookie（含 a1=...; web_session=...）'}
+                  style={{ ...inputStyle, flex: 1, minWidth: 240, padding: '5px 8px', fontSize: 12.5 }}
+                />
+              )}
+              <button
+                type="button"
+                style={{ ...ghostBtn, padding: '5px 10px', fontSize: 12.5 }}
+                disabled={srcBusy}
+                onClick={async () => {
+                  setSrcBusy(true)
+                  setXhsTestRes(null)
+                  try {
+                    const res = await fetch(`${API_BASE}/topics/sources/test-xhs`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        cookie: xhsCookie,
+                        xhs_mode: xhsMode,
+                        xhs_category: xhsCategory,
+                        xhs_keywords: xhsKeywords,
+                      }),
+                    })
+                    const d = await res.json()
+                    if (res.ok && d.ok) {
+                      const first = (d.samples || [])[0]?.title || ''
+                      const detail = typeof d.feed_count === 'number' ? `（频道 ${d.feed_count} + 热搜 ${d.search_count}）` : ''
+                      setXhsTestRes({ ok: true, text: `✓ [${d.mode}] ${d.elapsed_ms}ms 拉到 ${d.count} 条${detail}（如：${first.slice(0, 48)}）` })
+                    } else {
+                      setXhsTestRes({ ok: false, text: `✗ [${d.mode || xhsMode}] ${d.error || '测试失败'}` })
+                    }
+                  } catch (e) {
+                    setXhsTestRes({ ok: false, text: `✗ ${e}` })
+                  } finally {
+                    setSrcBusy(false)
+                  }
+                }}
+              >
+                {xhsMode === 'opencli' ? '测试 OpenCLI' : (xhsCookie.trim() ? '测试当前输入' : '测试当前引擎')}
+              </button>
+              <button
+                type="button"
+                style={{ ...goBtn, padding: '5px 12px', fontSize: 12.5 }}
+                disabled={srcBusy}
+                onClick={async () => {
+                  setSrcBusy(true)
+                  try {
+                    const res = await fetch(`${API_BASE}/topics/sources/xhs-auth`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        cookie: xhsCookie,
+                        xhs_mode: xhsMode,
+                        xhs_category: xhsCategory,
+                        xhs_keywords: xhsKeywords,
+                      }),
+                    })
+                    const d = await res.json()
+                    if (d.ok) {
+                      if (d.sources_config) setSrcCfg(d.sources_config)
+                      if (d.xhs_auth) setXhsAuthState(d.xhs_auth)
+                      setXhsCookie('')
+                      setMsg('✓ 已保存小红书订阅配置')
+                    }
+                  } catch (e) {
+                    setMsg(`✗ 保存失败：${e}`)
+                  } finally {
+                    setSrcBusy(false)
+                  }
+                }}
+              >
+                保存配置
+              </button>
+              {xhsAuthState.has_xhs_cookie && (
+                <button
+                  type="button"
+                  style={{ ...ghostBtn, padding: '5px 9px', fontSize: 12, opacity: 0.75 }}
+                  disabled={srcBusy}
+                  onClick={async () => {
+                    setSrcBusy(true)
+                    try {
+                      const res = await fetch(`${API_BASE}/topics/sources/xhs-auth`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ clear: true }),
+                      })
+                      const d = await res.json()
+                      if (d.ok) {
+                        if (d.xhs_auth) setXhsAuthState(d.xhs_auth)
+                        setXhsTestRes(null)
+                        setMsg('已清除小红书 Cookie')
+                      }
+                    } finally {
+                      setSrcBusy(false)
+                    }
+                  }}
+                >
+                  清除
+                </button>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: xhsTestRes ? 6 : 0 }}>
+              <span style={{ fontSize: 11.5, opacity: 0.65 }}>热搜关键词（最多点赞）</span>
+              {xhsKeywords.map((kw) => (
+                <span
+                  key={kw}
+                  style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    padding: '2px 7px',
+                    borderRadius: 999,
+                    fontSize: 11.5,
+                    background: 'rgba(196,167,125,0.15)',
+                    border: '1px solid rgba(196,167,125,0.35)',
+                  }}
+                >
+                  {kw}
+                  <button
+                    type="button"
+                    onClick={() => setXhsKeywords((prev) => prev.filter((k) => k !== kw))}
+                    style={{ border: 'none', background: 'none', color: 'inherit', cursor: 'pointer', padding: 0, fontSize: 12, opacity: 0.65 }}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              <input
+                value={newXhsKw}
+                onChange={(e) => setNewXhsKw(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    const v = newXhsKw.trim()
+                    if (v && !xhsKeywords.includes(v)) {
+                      setXhsKeywords((prev) => [...prev, v])
+                    }
+                    setNewXhsKw('')
+                  }
+                }}
+                placeholder="加词回车"
+                style={{ ...inputStyle, width: 96, padding: '3px 7px', fontSize: 11.5 }}
+              />
+            </div>
+            {xhsTestRes && (
+              <div style={{ fontSize: 12, color: xhsTestRes.ok ? '#3a9d5d' : '#e24b4a' }}>
+                {xhsTestRes.text}
+              </div>
+            )}
+          </div>
+
           <div style={{ padding: '10px 12px', borderRadius: 9, background: 'rgba(127,127,127,0.05)' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
               <div style={{ fontSize: 12.5, fontWeight: 600 }}>
@@ -1316,6 +1575,25 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
                 <span style={{ fontSize: 11.5, fontWeight: 600, padding: '2px 7px', borderRadius: 6, background: 'rgba(226,75,74,0.15)', color: '#e24b4a' }}>
                   🚀 {t.metrics_badge}
                 </span>
+              )}
+              {t.engagement_badge && (
+                <span
+                  title="小红书互动数据（点赞 · 收藏 · 评论）"
+                  style={{ fontSize: 11.5, fontWeight: 600, padding: '2px 7px', borderRadius: 6, background: 'rgba(218,165,32,0.14)', color: '#c48f16' }}
+                >
+                  {t.engagement_badge}
+                </span>
+              )}
+              {t.source_type === 'xiaohongshu' && !(t.engagement?.collects || t.engagement?.comments) && (
+                <button
+                  type="button"
+                  disabled={enrichingId === t.id}
+                  onClick={() => enrichTopic(t)}
+                  title="拉取完整点赞、收藏、评论及笔记正文"
+                  style={{ ...ghostBtn, padding: '2px 7px', fontSize: 11.5, opacity: 0.85 }}
+                >
+                  {enrichingId === t.id ? '补全中…' : '补全藏评'}
+                </button>
               )}
               {t.reason?.includes('多源共振') && (
                 <span style={{ fontSize: 11.5, fontWeight: 600, padding: '2px 7px', borderRadius: 6, background: 'rgba(237,123,47,0.16)', color: '#ed7b2f' }}>

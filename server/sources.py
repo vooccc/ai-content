@@ -7,7 +7,11 @@ import datetime
 import html
 import json
 import math
+import os
+import random
 import re
+import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -506,6 +510,7 @@ _HF_PAPERS_CACHE: Dict[str, Any] = {"ts": 0.0, "items": []}
 _REDDIT_CACHE: Dict[str, Dict[str, Any]] = {}
 _BLUESKY_CACHE: Dict[str, Dict[str, Any]] = {}
 _X_CACHE: Dict[str, Any] = {"ts": 0.0, "key": "", "items": []}
+_XHS_CACHE: Dict[str, Any] = {"ts": 0.0, "key": "", "items": [], "engine": ""}
 _X_OPS_CACHE: Dict[str, Any] = {"ts": 0.0, "ops": {}}
 
 # X Web 公开客户端 Bearer Token（配合用户自己的 auth_token + ct0 Cookie 使用）
@@ -1152,6 +1157,706 @@ def fetch_x_topics(
         return [], [f"X 抓取失败: {e}"]
 
 
+DEFAULT_XHS_KEYWORDS = ["AI工具", "AI Agent", "一人公司"]
+_XHS_EDITH_HOST = "https://edith.xiaohongshu.com"
+_XHS_WEB_HOST = "https://www.xiaohongshu.com"
+_XHS_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+)
+
+
+def _parse_xhs_cookie_str(raw: str) -> Dict[str, str]:
+    s = (raw or "").strip()
+    if not s:
+        return {}
+    if s.startswith("{"):
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                return {
+                    str(k).strip(): str(v).strip()
+                    for k, v in obj.items()
+                    if str(k).strip().isascii() and str(v).strip().isascii()
+                    and str(k).strip() not in ("nickname", "user_id", "tags")
+                }
+        except Exception:
+            pass
+    if s.lower().startswith("cookie:"):
+        s = s.split(":", 1)[1].strip()
+    out: Dict[str, str] = {}
+    for seg in s.split(";"):
+        part = seg.strip()
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if k and v and k.isascii() and v.isascii():
+            out[k] = v
+    return out
+
+
+def _parse_xhs_like_count(val: Any) -> int:
+    if isinstance(val, (int, float)):
+        return max(0, int(val))
+    s = str(val or "").strip().lower().replace(",", "").replace("+", "")
+    if not s:
+        return 0
+    try:
+        if "万" in s or "w" in s:
+            num = float(re.sub(r"[^\d.]", "", s) or 0)
+            return int(num * 10000)
+        if "k" in s:
+            num = float(re.sub(r"[^\d.]", "", s) or 0)
+            return int(num * 1000)
+        return int(float(re.sub(r"[^\d.]", "", s) or 0))
+    except Exception:
+        return 0
+
+
+def _format_count_cn(n: int) -> str:
+    val = max(0, int(n or 0))
+    if val >= 10000:
+        w = val / 10000.0
+        return f"{int(w)}万" if abs(w - round(w)) < 0.05 else f"{w:.1f}万"
+    return str(val)
+
+
+def _format_xhs_engagement_badge(likes: int = 0, collects: int = 0, comments: int = 0) -> str:
+    parts: List[str] = []
+    if likes > 0:
+        parts.append(f"👍 {_format_count_cn(likes)}")
+    if collects > 0:
+        parts.append(f"⭐ {_format_count_cn(collects)}")
+    if comments > 0:
+        parts.append(f"💬 {_format_count_cn(comments)}")
+    return " · ".join(parts)
+
+
+_XHS_NOTE_CACHE: Dict[str, Dict[str, Any]] = {}
+_XHS_NOTE_CACHE_TTL_SEC = 1800
+
+
+def _parse_xhs_note_url(url: str) -> tuple[str, str]:
+    s = (url or "").strip()
+    m = re.search(r"/(?:explore|search_result|discovery/item)/([0-9a-fA-F]{16,32})", s)
+    note_id = m.group(1) if m else ""
+    xsec_token = ""
+    try:
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(s).query)
+        xsec_token = str((qs.get("xsec_token") or [""])[0]).strip()
+    except Exception:
+        pass
+    return note_id, xsec_token
+
+
+def _find_opencli_bin() -> str:
+    found = shutil.which("opencli") or shutil.which("opencli.cmd")
+    if found:
+        return found
+    appdata = os.environ.get("APPDATA", "")
+    if appdata:
+        cand = os.path.join(appdata, "npm", "opencli.cmd")
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def _get_opencli_daemon_status() -> Dict[str, Any]:
+    try:
+        r = requests.get("http://127.0.0.1:19825/status", headers={"X-OpenCLI": "1"}, timeout=0.8)
+        if r.status_code == 200:
+            d = r.json()
+            if isinstance(d, dict) and d.get("ok"):
+                return {
+                    "running": True,
+                    "extension_connected": bool(d.get("extensionConnected")),
+                    "version": str(d.get("daemonVersion") or ""),
+                }
+    except Exception:
+        pass
+    return {"running": False, "extension_connected": False, "version": ""}
+
+
+def _extract_json_from_cli_stdout(raw: str) -> Any:
+    txt = (raw or "").strip()
+    if not txt:
+        return None
+    for ch in ("[", "{"):
+        idx = txt.find(ch)
+        if idx != -1:
+            try:
+                return json.loads(txt[idx:])
+            except Exception:
+                continue
+    return None
+
+
+def _parse_xhs_api_items(items: List[Dict[str, Any]], source_label: str = "小红书") -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        nid = str(it.get("id") or it.get("note_id") or "").strip()
+        if not nid or it.get("model_type") == "hot_query":
+            continue
+        card = it.get("note_card") or {}
+        title = str(card.get("display_title") or card.get("title") or it.get("title") or "").replace("\n", " ").strip()
+        if not title:
+            continue
+        user = card.get("user") or {}
+        author = str(user.get("nickname") or user.get("nick_name") or "").strip()
+        interact = card.get("interact_info") or {}
+        likes = _parse_xhs_like_count(interact.get("liked_count") or it.get("likes") or 0)
+        collects = _parse_xhs_like_count(interact.get("collected_count") or 0)
+        comments = _parse_xhs_like_count(interact.get("comment_count") or 0)
+        xsec_token = str(it.get("xsec_token") or "").strip()
+        url = f"{_XHS_WEB_HOST}/explore/{nid}"
+        if xsec_token:
+            url += f"?xsec_token={xsec_token}&xsec_source=pc_search"
+        note_type = "视频" if card.get("type") == "video" else "图文"
+        eng = {"likes": likes, "collects": collects, "comments": comments}
+        eng_badge = _format_xhs_engagement_badge(likes, collects, comments)
+        out.append({
+            "source_type": "xiaohongshu",
+            "source_name": f"{source_label}·{author}" if author else source_label,
+            "source_url": url,
+            "raw_title": trim_clean(title, 95),
+            "raw_summary": (f"{eng_badge} · " if eng_badge else "") + f"{note_type} · 作者 {author or '匿名'}",
+            "popularity": likes + collects * 2 + comments * 3,
+            "engagement": eng,
+            "engagement_badge": eng_badge,
+        })
+    return out
+
+
+def _fetch_xhs_via_xhshow(
+    cookie_str: str,
+    keywords: Optional[List[str]] = None,
+    category: str = "homefeed.career_v3",
+    limit: int = 18,
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    cookies = _parse_xhs_cookie_str(cookie_str)
+    if not cookies.get("a1"):
+        return [], ["请先配置小红书 Cookie（至少包含 a1 与 web_session）"]
+    try:
+        from xhshow import CryptoConfig, SessionManager, Xhshow
+    except Exception as e:
+        return [], [f"未安装 xhshow 签名库: {e}"]
+
+    cookies.setdefault("xsecappid", "xhs-pc-web")
+    cfg = CryptoConfig().with_overrides(PUBLIC_USERAGENT=_XHS_UA)
+    signer = Xhshow(cfg)
+    sess = SessionManager(cfg)
+    base_headers = {
+        "user-agent": _XHS_UA,
+        "content-type": "application/json;charset=UTF-8",
+        "origin": _XHS_WEB_HOST,
+        "referer": f"{_XHS_WEB_HOST}/",
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+    }
+
+    def _post_signed(uri: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sh = signer.sign_headers_post(uri, cookies, payload=payload, session=sess)
+        body = signer.build_json_body(payload)
+        r = requests.post(
+            f"{_XHS_EDITH_HOST}{uri}",
+            data=body.encode("utf-8"),
+            cookies=cookies,
+            headers={**base_headers, **sh},
+            timeout=14,
+        )
+        if r.status_code in (461, 471):
+            raise RuntimeError(f"小红书触发滑块验证（HTTP {r.status_code}），请在浏览器打开小红书完成一次验证后重试")
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("success"):
+            code = data.get("code")
+            msg = str(data.get("msg") or "")
+            if code in (-100, -101):
+                raise RuntimeError(f"小红书登录凭证无效或已过期（code={code}），请重新复制 Cookie")
+            if code == -104:
+                raise RuntimeError("小红书搜索无权限（code=-104），请确认 Cookie 中包含有效的 web_session")
+            if code == 300012:
+                raise RuntimeError("小红书请求触发 IP 频控（300012），请稍后再试")
+            if code == 300015:
+                raise RuntimeError("小红书签名校验未通过（300015），建议切换 OpenCLI 浏览器模式或更新 xhshow")
+            raise RuntimeError(f"小红书接口返回错误（code={code}）: {msg}")
+        return data.get("data") or {}
+
+    def _get_signed(uri: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        sh = signer.sign_headers_get(uri, cookies, params=params, session=sess)
+        full_uri = signer.build_url(uri, params)
+        r = requests.get(
+            f"{_XHS_EDITH_HOST}{full_uri}",
+            cookies=cookies,
+            headers={**base_headers, **sh},
+            timeout=12,
+        )
+        if r.status_code in (461, 471):
+            raise RuntimeError(f"小红书触发滑块验证（HTTP {r.status_code}）")
+        r.raise_for_status()
+        return r.json()
+
+    feed_items: List[Dict[str, Any]] = []
+    search_items: List[Dict[str, Any]] = []
+    errs: List[str] = []
+    seen_urls: set[str] = set()
+
+    # 1. 首页频道热门流
+    try:
+        feed_data = _post_signed("/api/sns/web/v1/homefeed", {
+            "cursor_score": "",
+            "num": 20,
+            "refresh_type": 1,
+            "note_index": 0,
+            "unread_begin_note_id": "",
+            "unread_end_note_id": "",
+            "unread_note_count": 0,
+            "category": (category or "homefeed.career_v3").strip(),
+            "search_key": "",
+            "need_num": 20,
+            "image_formats": ["jpg", "webp", "avif"],
+            "need_filter_image": False,
+        })
+        for it in _parse_xhs_api_items(feed_data.get("items") or [], source_label="小红书推荐"):
+            if it["source_url"] not in seen_urls:
+                seen_urls.add(it["source_url"])
+                feed_items.append(it)
+    except Exception as e:
+        errs.append(str(e))
+
+    # 2. 关键词热搜（page_size=20 + sort=general + onebox/filter 预热，避免 filters 参数触发静默空结果）
+    kws = [str(k).strip() for k in (keywords or DEFAULT_XHS_KEYWORDS) if str(k).strip()][:2]
+    if kws and cookies.get("web_session"):
+        for idx_kw, kw in enumerate(kws):
+            if idx_kw > 0:
+                time.sleep(random.uniform(0.6, 1.0))
+            sid = signer.get_search_id()
+            req_id = signer.get_search_request_id() if hasattr(signer, "get_search_request_id") else f"{random.randint(1_000_000_000, 2_147_483_647)}-{int(time.time() * 1000)}"
+            try:
+                _post_signed("/api/sns/web/v1/search/onebox", {
+                    "keyword": kw,
+                    "search_id": sid,
+                    "biz_type": "web_search_user",
+                    "request_id": req_id,
+                })
+                _get_signed("/api/sns/web/v1/search/filter", {"keyword": kw, "search_id": sid})
+            except Exception:
+                pass
+            try:
+                sdata = _post_signed("/api/sns/web/v1/search/notes", {
+                    "keyword": kw,
+                    "page": 1,
+                    "page_size": 20,
+                    "search_id": sid,
+                    "sort": "general",
+                    "note_type": 0,
+                    "ext_flags": [],
+                    "geo": "",
+                    "image_formats": ["jpg", "webp", "avif"],
+                })
+                for it in _parse_xhs_api_items(sdata.get("items") or [], source_label="小红书热搜"):
+                    if it["source_url"] not in seen_urls:
+                        seen_urls.add(it["source_url"])
+                        search_items.append(it)
+            except Exception as e:
+                errs.append(str(e))
+
+    feed_items.sort(key=lambda x: x["popularity"], reverse=True)
+    search_items.sort(key=lambda x: x["popularity"], reverse=True)
+    half = max(4, limit // 2)
+    merged: List[Dict[str, Any]] = []
+    merged_urls: set[str] = set()
+    for it in [*feed_items[:half], *search_items[:half], *feed_items[half:], *search_items[half:]]:
+        if it["source_url"] in merged_urls:
+            continue
+        merged_urls.add(it["source_url"])
+        merged.append(it)
+        if len(merged) >= limit:
+            break
+    return merged, (errs if not merged else [])
+
+
+def _fetch_xhs_via_opencli(
+    keywords: Optional[List[str]] = None,
+    limit: int = 18,
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    exe = _find_opencli_bin()
+    if not exe:
+        return [], ["未检测到 opencli 命令，请先安装 npm i -g @jackwener/opencli 并连接配套 Chrome 扩展"]
+
+    st = _get_opencli_daemon_status()
+    if st["running"] and not st["extension_connected"]:
+        return [], [
+            "OpenCLI CLI 已安装，但 Chrome 扩展尚未连接。请在 Chrome 打开 chrome://extensions 加载 D:\\AI_Project\\opencli-extension 后重试"
+        ]
+
+    # 若存在 dist/src/main.js 则直调 node，避免 Windows .cmd 壳额外开销
+    cmd_prefix: List[str] = [exe]
+    appdata = os.environ.get("APPDATA", "")
+    node_bin = shutil.which("node")
+    main_js = os.path.join(appdata, "npm", "node_modules", "@jackwener", "opencli", "dist", "src", "main.js") if appdata else ""
+    if node_bin and main_js and os.path.isfile(main_js):
+        cmd_prefix = [node_bin, main_js]
+
+    def _run(args: List[str]) -> Any:
+        kw_sub: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 25,
+        }
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kw_sub["creationflags"] = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.run([*cmd_prefix, *args], **kw_sub)
+        parsed = _extract_json_from_cli_stdout(proc.stdout)
+        if proc.returncode != 0:
+            err_msg = ""
+            if isinstance(parsed, dict):
+                err_obj = parsed.get("error") or {}
+                err_msg = str(err_obj.get("message") or err_obj.get("code") or "")
+            err_msg = err_msg or (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:180]
+            if "AUTH_REQUIRED" in err_msg or "login" in err_msg.lower():
+                raise RuntimeError("OpenCLI 检测到浏览器未登录小红书，请先在 Chrome 登录 xiaohongshu.com")
+            if "SECURITY_BLOCK" in err_msg or "captcha" in err_msg.lower():
+                raise RuntimeError("OpenCLI 触发小红书滑块验证，请在 Chrome 页面手动过一次验证后重试")
+            raise RuntimeError(f"OpenCLI 执行失败: {err_msg}")
+        if isinstance(parsed, dict) and "data" in parsed:
+            return parsed.get("data")
+        return parsed
+
+    all_items: List[Dict[str, Any]] = []
+    errs: List[str] = []
+    seen_urls: set[str] = set()
+
+    def _ingest(rows: Any, label: str) -> None:
+        if not isinstance(rows, list):
+            return
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "").replace("\n", " ").strip()
+            url = str(row.get("url") or "").strip()
+            if not title or not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            author = str(row.get("author") or "").strip()
+            likes = _parse_xhs_like_count(row.get("likes") or 0)
+            collects = _parse_xhs_like_count(row.get("collects") or 0)
+            comments = _parse_xhs_like_count(row.get("comments") or 0)
+            pub = str(row.get("published_at") or "").strip()
+            eng = {"likes": likes, "collects": collects, "comments": comments}
+            eng_badge = _format_xhs_engagement_badge(likes, collects, comments)
+            all_items.append({
+                "source_type": "xiaohongshu",
+                "source_name": f"{label}·{author}" if author else label,
+                "source_url": url,
+                "raw_title": trim_clean(title, 95),
+                "raw_summary": (f"{eng_badge} · " if eng_badge else "") + f"作者 {author or '匿名'}" + (f" · {pub}" if pub else ""),
+                "popularity": likes + collects * 2 + comments * 3,
+                "engagement": eng,
+                "engagement_badge": eng_badge,
+            })
+
+    try:
+        _ingest(_run(["xiaohongshu", "feed", "--limit", "10", "-f", "json"]), "小红书推荐")
+    except Exception as e:
+        errs.append(str(e))
+
+    kws = [str(k).strip() for k in (keywords or DEFAULT_XHS_KEYWORDS) if str(k).strip()][:2]
+    for kw in kws:
+        try:
+            _ingest(
+                _run(["xiaohongshu", "search", kw, "--sort", "most-liked", "--publish-time", "week", "--limit", "10", "-f", "json"]),
+                "小红书热搜",
+            )
+        except Exception as e:
+            errs.append(str(e))
+
+    all_items.sort(key=lambda x: x["popularity"], reverse=True)
+    return all_items[:limit], (errs if not all_items else [])
+
+
+def fetch_xiaohongshu_topics(
+    mode: str = "xhshow",
+    keywords: Optional[List[str]] = None,
+    category: str = "homefeed.career_v3",
+    limit: int = 18,
+    cookie_str: str = "",
+    use_cache: bool = True,
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    """双引擎抓取小红书热门笔记：支持 xhshow 纯算直连、OpenCLI 浏览器桥接、或 auto 自动降级。"""
+    m = (mode or "xhshow").strip().lower()
+    if m not in ("xhshow", "opencli", "auto"):
+        m = "xhshow"
+
+    if not cookie_str:
+        from . import settings_store
+        cookie_str = str(settings_store.load_settings().get("xhs_cookie") or "").strip()
+
+    # 若未配置任何凭证且处于默认 xhshow 模式、也未明确测试，静默跳过避免拖慢常规刷新
+    if m == "xhshow" and not cookie_str and use_cache:
+        return [], []
+    if m == "auto" and not _find_opencli_bin() and not cookie_str and use_cache:
+        return [], []
+
+    kws_clean = [str(k).strip() for k in (keywords or DEFAULT_XHS_KEYWORDS) if str(k).strip()][:5]
+    cache_key = f"{m}:{category}:{'|'.join(kws_clean)}"
+    now = time.time()
+    if (
+        use_cache
+        and _XHS_CACHE["items"]
+        and _XHS_CACHE["key"] == cache_key
+        and (now - _XHS_CACHE["ts"] < _RSS_CACHE_TTL_SEC)
+    ):
+        return list(_XHS_CACHE["items"][:limit]), []
+
+    items: List[Dict[str, Any]] = []
+    errs: List[str] = []
+    used_engine = m
+    if m == "opencli":
+        items, errs = _fetch_xhs_via_opencli(keywords=kws_clean, limit=limit)
+    elif m == "auto":
+        if _find_opencli_bin():
+            items, errs = _fetch_xhs_via_opencli(keywords=kws_clean, limit=limit)
+            used_engine = "opencli"
+        if not items and cookie_str:
+            items2, errs2 = _fetch_xhs_via_xhshow(cookie_str, keywords=kws_clean, category=category, limit=limit)
+            if items2:
+                items, errs, used_engine = items2, [], "xhshow"
+            elif not errs:
+                errs = errs2
+    else:
+        items, errs = _fetch_xhs_via_xhshow(cookie_str, keywords=kws_clean, category=category, limit=limit)
+
+    if use_cache and items:
+        _XHS_CACHE["ts"] = now
+        _XHS_CACHE["key"] = cache_key
+        _XHS_CACHE["items"] = items
+        _XHS_CACHE["engine"] = used_engine
+    return items[:limit], errs
+
+
+def _fetch_xhs_note_via_opencli(url: str) -> Dict[str, Any]:
+    exe = _find_opencli_bin()
+    if not exe:
+        return {}
+    st = _get_opencli_daemon_status()
+    if st["running"] and not st["extension_connected"]:
+        return {}
+    cmd_prefix: List[str] = [exe]
+    appdata = os.environ.get("APPDATA", "")
+    node_bin = shutil.which("node")
+    main_js = os.path.join(appdata, "npm", "node_modules", "@jackwener", "opencli", "dist", "src", "main.js") if appdata else ""
+    if node_bin and main_js and os.path.isfile(main_js):
+        cmd_prefix = [node_bin, main_js]
+    kw_sub: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 22,
+    }
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kw_sub["creationflags"] = subprocess.CREATE_NO_WINDOW
+    proc = subprocess.run([*cmd_prefix, "xiaohongshu", "note", url, "-f", "json"], **kw_sub)
+    parsed = _extract_json_from_cli_stdout(proc.stdout)
+    if proc.returncode != 0 or not isinstance(parsed, dict):
+        return {}
+    rows = parsed.get("data")
+    if not isinstance(rows, list):
+        return {}
+    kv: Dict[str, str] = {}
+    for row in rows:
+        if isinstance(row, dict) and row.get("field"):
+            kv[str(row["field"]).strip()] = str(row.get("value") or "").strip()
+    if not kv:
+        return {}
+    likes = _parse_xhs_like_count(kv.get("likes") or 0)
+    collects = _parse_xhs_like_count(kv.get("collects") or 0)
+    comments = _parse_xhs_like_count(kv.get("comments") or 0)
+    return {
+        "title": kv.get("title") or "",
+        "author": kv.get("author") or "",
+        "content": kv.get("content") or "",
+        "likes": likes,
+        "collects": collects,
+        "comments": comments,
+        "engagement": {"likes": likes, "collects": collects, "comments": comments},
+        "engagement_badge": _format_xhs_engagement_badge(likes, collects, comments),
+    }
+
+
+def _fetch_xhs_note_via_xhshow(url: str, cookie_str: str) -> Dict[str, Any]:
+    note_id, xsec_token = _parse_xhs_note_url(url)
+    cookies = _parse_xhs_cookie_str(cookie_str)
+    if not note_id or not cookies.get("a1"):
+        return {}
+    try:
+        from xhshow import CryptoConfig, SessionManager, Xhshow
+    except Exception:
+        return {}
+    cookies.setdefault("xsecappid", "xhs-pc-web")
+    cfg = CryptoConfig().with_overrides(PUBLIC_USERAGENT=_XHS_UA)
+    signer = Xhshow(cfg)
+    sess = SessionManager(cfg)
+    uri = "/api/sns/web/v1/feed"
+    payload: Dict[str, Any] = {
+        "source_note_id": note_id,
+        "image_formats": ["jpg", "webp", "avif"],
+        "extra": {"need_body_topic": "1"},
+        "xsec_source": "pc_search",
+        "xsec_token": xsec_token,
+    }
+    sh = signer.sign_headers_post(uri, cookies, payload=payload, session=sess)
+    body = signer.build_json_body(payload)
+    r = requests.post(
+        f"{_XHS_EDITH_HOST}{uri}",
+        data=body.encode("utf-8"),
+        cookies=cookies,
+        headers={
+            "user-agent": _XHS_UA,
+            "content-type": "application/json;charset=UTF-8",
+            "origin": _XHS_WEB_HOST,
+            "referer": f"{_XHS_WEB_HOST}/",
+            "accept": "application/json, text/plain, */*",
+            **sh,
+        },
+        timeout=12,
+    )
+    if r.status_code != 200:
+        return {}
+    data = r.json()
+    if not data.get("success"):
+        return {}
+    items = ((data.get("data") or {}).get("items") or [])
+    if not items or not isinstance(items[0], dict):
+        return {}
+    card = items[0].get("note_card") or {}
+    interact = card.get("interact_info") or {}
+    user = card.get("user") or {}
+    likes = _parse_xhs_like_count(interact.get("liked_count") or 0)
+    collects = _parse_xhs_like_count(interact.get("collected_count") or 0)
+    comments = _parse_xhs_like_count(interact.get("comment_count") or 0)
+    return {
+        "title": str(card.get("title") or card.get("display_title") or "").strip(),
+        "author": str(user.get("nickname") or "").strip(),
+        "content": str(card.get("desc") or "").strip(),
+        "likes": likes,
+        "collects": collects,
+        "comments": comments,
+        "engagement": {"likes": likes, "collects": collects, "comments": comments},
+        "engagement_badge": _format_xhs_engagement_badge(likes, collects, comments),
+    }
+
+
+def fetch_xiaohongshu_note_detail(
+    url: str,
+    mode: str = "auto",
+    cookie_str: str = "",
+    use_cache: bool = True,
+) -> Dict[str, Any]:
+    """按单篇 URL 拉取小红书完整互动数据（点赞/收藏/评论）与笔记正文。"""
+    u = (url or "").strip()
+    if not u:
+        return {}
+    note_id, _ = _parse_xhs_note_url(u)
+    ckey = note_id or u
+    now = time.time()
+    cached = _XHS_NOTE_CACHE.get(ckey)
+    if use_cache and cached and (now - float(cached.get("ts") or 0)) < _XHS_NOTE_CACHE_TTL_SEC:
+        return dict(cached.get("data") or {})
+
+    m = (mode or "auto").strip().lower()
+    if not cookie_str:
+        from . import settings_store
+        cookie_str = str(settings_store.load_settings().get("xhs_cookie") or "").strip()
+
+    detail: Dict[str, Any] = {}
+    if m == "opencli":
+        try:
+            detail = _fetch_xhs_note_via_opencli(u)
+        except Exception:
+            detail = {}
+    elif m == "xhshow":
+        if cookie_str:
+            try:
+                detail = _fetch_xhs_note_via_xhshow(u, cookie_str)
+            except Exception:
+                detail = {}
+    else:
+        if _find_opencli_bin():
+            try:
+                detail = _fetch_xhs_note_via_opencli(u)
+            except Exception:
+                detail = {}
+        if not detail and cookie_str:
+            try:
+                detail = _fetch_xhs_note_via_xhshow(u, cookie_str)
+            except Exception:
+                detail = {}
+
+    if detail and use_cache:
+        _XHS_NOTE_CACHE[ckey] = {"ts": now, "data": dict(detail)}
+    return detail
+
+
+def enrich_xiaohongshu_items(
+    items: List[Dict[str, Any]],
+    mode: str = "",
+    cookie_str: str = "",
+    max_items: int = 5,
+) -> int:
+    """只对最终入选的小红书精选条目补全点赞/收藏/评论与正文摘要，避免全量抓详情触发风控。"""
+    if not items:
+        return 0
+    m = (mode or "").strip().lower()
+    if not m:
+        from . import db as _db
+        sc = (_db.get_primary_account().get("sources_config") or {})
+        m = str(sc.get("xhs_mode") or "auto").strip().lower()
+    enriched = 0
+    for it in items:
+        if enriched >= max_items:
+            break
+        if str(it.get("source_type") or "") != "xiaohongshu":
+            continue
+        url = str(it.get("source_url") or "").strip()
+        if not url:
+            continue
+        cur_eng = it.get("engagement") if isinstance(it.get("engagement"), dict) else {}
+        if int(cur_eng.get("collects") or 0) > 0 and int(cur_eng.get("comments") or 0) > 0:
+            continue
+        if enriched > 0:
+            time.sleep(0.25)
+        detail = fetch_xiaohongshu_note_detail(url, mode=m, cookie_str=cookie_str)
+        if not detail:
+            continue
+        likes = max(int(cur_eng.get("likes") or 0), int(detail.get("likes") or 0))
+        collects = max(int(cur_eng.get("collects") or 0), int(detail.get("collects") or 0))
+        comments = max(int(cur_eng.get("comments") or 0), int(detail.get("comments") or 0))
+        badge = _format_xhs_engagement_badge(likes, collects, comments)
+        it["engagement"] = {"likes": likes, "collects": collects, "comments": comments}
+        if badge:
+            it["engagement_badge"] = badge
+        it["popularity"] = max(int(it.get("popularity") or 0), likes + collects * 2 + comments * 3)
+        content = str(detail.get("content") or "").replace("\r", " ").strip()
+        if content:
+            it["raw_summary"] = (f"{badge} · " if badge else "") + trim_clean(content, 240)
+        elif badge:
+            old_sum = str(it.get("raw_summary") or "").strip()
+            if "👍" not in old_sum:
+                it["raw_summary"] = f"{badge} · {old_sum}".strip(" ·")
+        enriched += 1
+    return enriched
+
+
 def gather_all_sources(
     sources_config: Dict[str, Any],
     search_terms: Optional[List[str]] = None,
@@ -1168,6 +1873,7 @@ def gather_all_sources(
         "reddit": 0,
         "bluesky": 0,
         "x": 0,
+        "xiaohongshu": 0,
         "bilibili": 0,
         "weibo_hot": 0,
         "rss": 0,
@@ -1177,7 +1883,7 @@ def gather_all_sources(
     merged_terms = list(dict.fromkeys([*(base_keywords), *(search_terms or [])]))
 
     tasks = {}
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    with ThreadPoolExecutor(max_workers=11) as pool:
         if cfg.get("github_trending", True):
             langs = cfg.get("github_languages") or ["python", "typescript", ""]
             tasks[pool.submit(lambda: (fetch_github_trending(languages=langs, limit=12), []))] = "github_trending"
@@ -1209,6 +1915,11 @@ def gather_all_sources(
                 x_search_kws,
                 x_min_faves,
             )] = "x"
+        if cfg.get("xiaohongshu", True):
+            xhs_mode = str(cfg.get("xhs_mode") or "xhshow")
+            xhs_kws = cfg.get("xhs_keywords") or DEFAULT_XHS_KEYWORDS
+            xhs_cat = str(cfg.get("xhs_category") or "homefeed.career_v3")
+            tasks[pool.submit(fetch_xiaohongshu_topics, xhs_mode, xhs_kws, xhs_cat, 18)] = "xiaohongshu"
         if cfg.get("bilibili", True):
             bili_kws = base_keywords or ["AI工具实操", "一人公司", "Claude Code"]
             tasks[pool.submit(fetch_bilibili_topics, bili_kws, cfg.get("bilibili_accounts") or [], 4)] = "bilibili"

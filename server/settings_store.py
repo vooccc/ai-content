@@ -21,9 +21,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "tavily_api_key": "",
     "x_auth_token": "",
     "x_ct0": "",
+    "xhs_cookie": "",
 }
 
-_SECRET_FIELDS = ("gateway_token", "llm_api_key", "image_api_key", "tavily_api_key", "x_auth_token", "x_ct0")
+_SECRET_FIELDS = ("gateway_token", "llm_api_key", "image_api_key", "tavily_api_key", "x_auth_token", "x_ct0", "xhs_cookie")
 
 
 def mask_secret(val: str) -> str:

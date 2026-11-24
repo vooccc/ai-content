@@ -93,6 +93,7 @@ def list_topics(status: str = "", source_type: str = "", filter: str = "", limit
 
 @router.get("/topics/sources")
 def get_topic_sources():
+    from . import sources
     acc = db.get_primary_account()
     sc = acc.get("sources_config") or {}
     ms = settings_store.get_masked_settings()
@@ -109,6 +110,12 @@ def get_topic_sources():
             "x_auth_token_masked": ms.get("x_auth_token_masked") or "",
             "has_x_ct0": bool(ms.get("has_x_ct0")),
             "x_ct0_masked": ms.get("x_ct0_masked") or "",
+        },
+        "xhs_auth": {
+            "has_xhs_cookie": bool(ms.get("has_xhs_cookie")),
+            "xhs_cookie_masked": ms.get("xhs_cookie_masked") or "",
+            "opencli_installed": bool(sources._find_opencli_bin()),
+            "opencli_extension_connected": bool(sources._get_opencli_daemon_status().get("extension_connected")),
         },
     }
 
@@ -199,6 +206,83 @@ def test_x_source(req: XAuthRequest):
     }
 
 
+class XhsAuthRequest(BaseModel):
+    cookie: str = ""
+    xhs_mode: Optional[str] = None
+    xhs_category: Optional[str] = None
+    xhs_keywords: Optional[List[str]] = None
+    clear: bool = False
+
+
+@router.post("/topics/sources/xhs-auth")
+def save_xhs_auth(req: XhsAuthRequest):
+    from . import sources
+    if req.clear:
+        ms = settings_store.update_settings({"clear_xhs_cookie": True})
+    else:
+        patch: Dict[str, Any] = {}
+        if req.cookie.strip() and "****" not in req.cookie:
+            patch["xhs_cookie"] = req.cookie.strip()
+        ms = settings_store.update_settings(patch) if patch else settings_store.get_masked_settings()
+    acc = db.get_primary_account()
+    sc = dict(acc.get("sources_config") or {})
+    if req.xhs_mode in ("xhshow", "opencli", "auto"):
+        sc["xhs_mode"] = req.xhs_mode
+    if req.xhs_category is not None and req.xhs_category.strip():
+        sc["xhs_category"] = req.xhs_category.strip()
+    if req.xhs_keywords is not None:
+        sc["xhs_keywords"] = [str(k).strip() for k in req.xhs_keywords if str(k).strip()][:5]
+    if ms.get("has_xhs_cookie") or sc.get("xhs_mode") in ("opencli", "auto"):
+        sc["xiaohongshu"] = True
+    updated = db.update_primary_account({"sources_config": sc})
+    return {
+        "ok": True,
+        "sources_config": updated.get("sources_config") or sc,
+        "xhs_auth": {
+            "has_xhs_cookie": bool(ms.get("has_xhs_cookie")),
+            "xhs_cookie_masked": ms.get("xhs_cookie_masked") or "",
+            "opencli_installed": bool(sources._find_opencli_bin()),
+            "opencli_extension_connected": bool(sources._get_opencli_daemon_status().get("extension_connected")),
+        },
+    }
+
+
+@router.post("/topics/sources/test-xhs")
+def test_xhs_source(req: XhsAuthRequest):
+    import time as _time
+    from . import sources
+    raw_st = settings_store.load_settings()
+    cookie_val = req.cookie.strip() if (req.cookie.strip() and "****" not in req.cookie) else str(raw_st.get("xhs_cookie") or "").strip()
+    sc = (db.get_primary_account().get("sources_config") or {})
+    mode = req.xhs_mode if req.xhs_mode in ("xhshow", "opencli", "auto") else str(sc.get("xhs_mode") or "xhshow")
+    cat = req.xhs_category.strip() if (req.xhs_category and req.xhs_category.strip()) else str(sc.get("xhs_category") or "homefeed.career_v3")
+    kws = req.xhs_keywords if req.xhs_keywords is not None else (sc.get("xhs_keywords") or sources.DEFAULT_XHS_KEYWORDS)
+
+    t0 = _time.time()
+    items, errs = sources.fetch_xiaohongshu_topics(
+        mode=mode,
+        keywords=kws,
+        category=cat,
+        limit=12,
+        cookie_str=cookie_val,
+        use_cache=False,
+    )
+    elapsed_ms = int((_time.time() - t0) * 1000)
+    if errs and not items:
+        return JSONResponse({"ok": False, "error": errs[0], "elapsed_ms": elapsed_ms, "mode": mode}, status_code=400)
+    feed_count = sum(1 for it in items if str(it.get("source_name") or "").startswith("小红书推荐"))
+    search_count = len(items) - feed_count
+    return {
+        "ok": True,
+        "mode": mode,
+        "elapsed_ms": elapsed_ms,
+        "count": len(items),
+        "feed_count": feed_count,
+        "search_count": search_count,
+        "samples": [{"title": it["raw_title"], "url": it["source_url"], "source": it["source_name"]} for it in items[:4]],
+    }
+
+
 class TestRssRequest(BaseModel):
     url: str = ""
     name: str = ""
@@ -251,6 +335,7 @@ def list_intel(credibility: str = "", source_type: str = "", q: str = "", limit:
         "ok": True,
         "items": items,
         "counts": db.intel_counts(),
+        "source_counts": db.intel_source_counts(),
     }
 
 
@@ -350,6 +435,17 @@ def patch_topic(topic_id: str, req: PatchTopicRequest):
     return {"ok": True, "topic": updated}
 
 
+@router.post("/topics/{topic_id}/enrich")
+def enrich_topic(topic_id: str):
+    try:
+        tp = topic_engine.enrich_topic_engagement(topic_id)
+        return {"ok": True, "topic": tp}
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 class StartTopicRequest(BaseModel):
     selected_title: str = ""
 
@@ -395,6 +491,8 @@ def _create_project_from_topic(topic_id: str, selected_title: str = "") -> Dict[
     material_blocks = [_build_account_constraint_note(account, tp)]
     if tp.get("metrics_badge"):
         material_blocks.append(f"【爆款信号】{tp['metrics_badge']}")
+    if tp.get("engagement_badge"):
+        material_blocks.append(f"【平台互动数据】{tp['engagement_badge']}")
     if tp.get("raw_summary"):
         material_blocks.append(f"【选题原始素材（{tp.get('source_name') or tp.get('source_type')}）】\n{tp['raw_summary']}")
     sigs = tp.get("raw_signals") or []
