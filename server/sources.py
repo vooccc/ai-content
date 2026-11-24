@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import html
+import json
 import math
 import re
 import threading
@@ -503,6 +505,14 @@ OFFICIAL_AI_RSS_PRESETS: List[Dict[str, Any]] = [
 _HF_PAPERS_CACHE: Dict[str, Any] = {"ts": 0.0, "items": []}
 _REDDIT_CACHE: Dict[str, Dict[str, Any]] = {}
 _BLUESKY_CACHE: Dict[str, Dict[str, Any]] = {}
+_X_CACHE: Dict[str, Any] = {"ts": 0.0, "key": "", "items": []}
+_X_OPS_CACHE: Dict[str, Any] = {"ts": 0.0, "ops": {}}
+
+# X Web 公开客户端 Bearer Token（配合用户自己的 auth_token + ct0 Cookie 使用）
+_X_WEB_BEARER = (
+    "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
+    "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
 
 DEFAULT_REDDIT_SUBREDDITS = ["LocalLLaMA", "ClaudeAI", "MachineLearning"]
 DEFAULT_BLUESKY_HANDLES = [
@@ -775,6 +785,373 @@ def fetch_wechat_topics(keywords: List[str], limit_per_kw: int = 4) -> tuple[Lis
     return items, errors
 
 
+def _parse_x_graphql_tweets(payload: Any) -> List[Dict[str, Any]]:
+    """递归提取 X GraphQL 响应中的 tweet_results（兼容 HomeLatestTimeline 与 ListLatestTweetsTimeline）。"""
+    tweet_objs: List[Dict[str, Any]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if "tweet_results" in node and isinstance(node["tweet_results"], dict):
+                res = node["tweet_results"].get("result")
+                if isinstance(res, dict):
+                    tweet_objs.append(res)
+                return
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(payload)
+    out: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for t_res in tweet_objs:
+        if t_res.get("__typename") == "TweetWithVisibilityResults":
+            t_res = t_res.get("tweet") or {}
+        if not isinstance(t_res, dict) or t_res.get("__typename") == "TweetTombstone":
+            continue
+        leg = t_res.get("legacy") or {}
+        if not isinstance(leg, dict) or not leg:
+            continue
+        # 纯转发（无评论）跳过，保留原创与引用推文
+        if leg.get("retweeted_status_result") and not leg.get("is_quote_status"):
+            continue
+        tid = str(t_res.get("rest_id") or leg.get("id_str") or "").strip()
+        if tid and tid in seen_ids:
+            continue
+        if tid:
+            seen_ids.add(tid)
+
+        note = ((((t_res.get("note_tweet") or {}).get("note_tweet_results") or {}).get("result") or {}).get("text")) or ""
+        text = html.unescape(str(note or leg.get("full_text") or "")).replace("\n", " ").strip()
+        text = re.sub(r"https://t\.co/\S+$", "", text).strip()
+        if len(text) < 16:
+            continue
+
+        u_res = (((t_res.get("core") or {}).get("user_results") or {}).get("result")) or {}
+        u_core = u_res.get("core") or {}
+        u_leg = u_res.get("legacy") or {}
+        screen = str(u_core.get("screen_name") or u_leg.get("screen_name") or "").strip()
+        name = str(u_core.get("name") or u_leg.get("name") or screen or "X").strip()
+        url = f"https://x.com/{screen}/status/{tid}" if (screen and tid) else "https://x.com"
+        likes = int(leg.get("favorite_count") or 0)
+        rts = int(leg.get("retweet_count") or 0)
+        replies = int(leg.get("reply_count") or 0)
+        urls = ((leg.get("entities") or {}).get("urls") or [])
+        ext = str(urls[0].get("expanded_url") or "") if urls else ""
+        extra = f" | 引用: {ext}" if ext else ""
+        out.append({
+            "source_type": "x",
+            "source_name": f"X·{name}" if name else "X",
+            "source_url": url,
+            "raw_title": f"@{screen}：{trim_clean(text, 88)}" if screen else trim_clean(text, 95),
+            "raw_summary": f"{text[:300]} | 赞 {likes} / 转 {rts}{extra}",
+            "popularity": likes + rts * 2 + replies,
+        })
+    return out
+
+
+def _extract_x_list_id(raw: str) -> str:
+    s = (raw or "").strip()
+    m = re.search(r"/lists/(\d+)", s)
+    if m:
+        return m.group(1)
+    m2 = re.search(r"(\d{6,})", s)
+    return m2.group(1) if m2 else ""
+
+
+DEFAULT_X_SEARCH_KEYWORDS = ["AI Agent", "Claude Code", "OpenAI", "LLM"]
+
+
+def _resolve_x_graphql_ops(auth_token: str, ct0: str, needed: Optional[List[str]] = None, force: bool = False) -> Dict[str, Dict[str, Any]]:
+    """从登录态 x.com/home 的 webpack chunk / main.js 动态提取最新 GraphQL queryId 与 featureSwitches。"""
+    now = time.time()
+    want = needed or ["HomeLatestTimeline", "ListLatestTweetsTimeline", "SearchTimeline"]
+    if not force and _X_OPS_CACHE["ops"] and (now - _X_OPS_CACHE["ts"] < 1800):
+        if all(op in _X_OPS_CACHE["ops"] for op in want):
+            return _X_OPS_CACHE["ops"]
+
+    html_r = requests.get(
+        "https://x.com/home",
+        headers={"User-Agent": _UA, "Cookie": f"auth_token={auth_token}; ct0={ct0}"},
+        timeout=12,
+    )
+    if html_r.status_code in (401, 403):
+        raise RuntimeError(f"X Cookie 已失效或被拦截（HTTP {html_r.status_code}）")
+    html_text = html_r.text
+    idx = html_text.find("t.u=")
+    if idx == -1:
+        raise RuntimeError("X 登录态无效（未返回已登录首页，请重新复制 auth_token 与 ct0）")
+    end_idx = html_text.find("</script>", idx)
+    tu_block = html_text[idx:end_idx if end_idx != -1 else idx + 60000]
+    parts = tu_block.split("[e]")
+    if len(parts) < 2:
+        raise RuntimeError("无法解析 X 前端脚本映射表")
+    names = dict(re.findall(r'(\d+):"([^"]+)"', parts[0]))
+    hashes = dict(re.findall(r'(\d+):"([a-f0-9]{10,})"', parts[1]))
+
+    ops: Dict[str, Dict[str, Any]] = dict(_X_OPS_CACHE.get("ops") or {})
+    target_ops = ("HomeLatestTimeline", "HomeTimeline", "ListLatestTweetsTimeline", "SearchTimeline")
+
+    def _extract_ops_from_js(js: str) -> None:
+        for m in re.finditer(
+            r'queryId:"([A-Za-z0-9_-]+)",operationName:"([^"]+)",operationType:"query"(?:,metadata:\{featureSwitches:\[(.*?)\])?',
+            js,
+        ):
+            op_name = m.group(2)
+            if op_name in target_ops:
+                sw = re.findall(r'"([^"]+)"', m.group(3) or "")
+                ops[op_name] = {"queryId": m.group(1), "switches": sw}
+
+    def _scan_chunk(cid: str) -> None:
+        h = hashes.get(cid)
+        if not h:
+            return
+        prefix = names.get(cid, cid)
+        js = requests.get(f"https://abs.twimg.com/responsive-web/client-web/{prefix}.{h}a.js", headers={"User-Agent": _UA}, timeout=12).text
+        _extract_ops_from_js(js)
+
+    # 1. SearchTimeline 在 main.*.js，Home/List 在特定 chunk
+    if "SearchTimeline" in want and "SearchTimeline" not in ops:
+        main_urls = re.findall(r'https://abs\.twimg\.com/responsive-web/client-web/main\.[A-Za-z0-9]+\.js', html_text)
+        if main_urls:
+            mjs = requests.get(main_urls[0], headers={"User-Agent": _UA}, timeout=12).text
+            _extract_ops_from_js(mjs)
+
+    priority_cids = [
+        cid for cid, cname in names.items()
+        if "HomeTimeline" in cname or "JetfuelWrapper" in cname
+    ]
+    for cid in priority_cids:
+        if all(op in ops for op in want):
+            break
+        _scan_chunk(cid)
+
+    # 2. 若 X 调整打包名导致未命中 ListLatestTweetsTimeline，则从 loader.ListHandler 引用链兜底扫描
+    if any(op not in ops for op in want if op != "SearchTimeline"):
+        list_cids = [cid for cid, cname in names.items() if cname == "loader.ListHandler"]
+        extra_cids: List[str] = []
+        for lcid in list_cids:
+            lh = hashes.get(lcid)
+            if lh:
+                ljs = requests.get(f"https://abs.twimg.com/responsive-web/client-web/loader.ListHandler.{lh}a.js", headers={"User-Agent": _UA}, timeout=10).text
+                extra_cids.extend(re.findall(r'[a-z]\.e\((\d+)\)', ljs))
+        if extra_cids:
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                list(pool.map(_scan_chunk, list(dict.fromkeys(extra_cids))[:50]))
+
+    if ops:
+        _X_OPS_CACHE["ts"] = now
+        _X_OPS_CACHE["ops"] = ops
+    return ops
+
+
+def _build_x_search_query(keywords: Optional[List[str]] = None, min_faves: int = 100, days: int = 4) -> str:
+    kws = [str(k).strip() for k in (keywords or DEFAULT_X_SEARCH_KEYWORDS) if str(k).strip()][:8]
+    if not kws:
+        kws = list(DEFAULT_X_SEARCH_KEYWORDS)
+    terms = " OR ".join(f'"{k}"' if (" " in k or not k.isascii()) else k for k in kws)
+    since_date = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=max(1, days))).strftime("%Y-%m-%d")
+    faves = max(10, int(min_faves or 100))
+    return f"({terms}) min_faves:{faves} since:{since_date} -filter:retweets"
+
+
+def _fetch_x_search_tweets(
+    auth_token: str,
+    ct0: str,
+    ops: Dict[str, Dict[str, Any]],
+    keywords: Optional[List[str]] = None,
+    min_faves: int = 100,
+    limit: int = 14,
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    op = ops.get("SearchTimeline")
+    if not op:
+        return [], ["未能从 X 前端提取 SearchTimeline 接口标识"]
+    headers = {
+        "User-Agent": _UA,
+        "Authorization": _X_WEB_BEARER,
+        "x-csrf-token": ct0,
+        "x-twitter-auth-type": "OAuth2Session",
+        "x-twitter-active-user": "yes",
+        "x-twitter-client-language": "en",
+        "Cookie": f"auth_token={auth_token}; ct0={ct0}",
+        "Referer": "https://x.com/search",
+    }
+    raw_query = _build_x_search_query(keywords, min_faves=min_faves)
+    payload = {
+        "variables": {
+            "rawQuery": raw_query,
+            "count": max(limit * 2, 20),
+            "querySource": "typed_query",
+            "product": "Top",
+        },
+        "features": {k: True for k in (op.get("switches") or [])},
+    }
+    endpoint = f"https://x.com/i/api/graphql/{op['queryId']}/SearchTimeline"
+    r = requests.post(endpoint, json=payload, headers=headers, timeout=15)
+    if r.status_code == 404:
+        ops2 = _resolve_x_graphql_ops(auth_token, ct0, needed=["SearchTimeline"], force=True)
+        op2 = ops2.get("SearchTimeline")
+        if op2:
+            payload["features"] = {k: True for k in (op2.get("switches") or [])}
+            r = requests.post(f"https://x.com/i/api/graphql/{op2['queryId']}/SearchTimeline", json=payload, headers=headers, timeout=15)
+    if r.status_code in (401, 403):
+        return [], [f"X 热门搜索被拦截（HTTP {r.status_code}）"]
+    if r.status_code == 429:
+        return [], ["X 热门搜索触发限流（HTTP 429），稍后再试"]
+    r.raise_for_status()
+    data = r.json()
+    items = _parse_x_graphql_tweets(data)
+    for it in items:
+        if it.get("source_name") and not str(it["source_name"]).startswith("X热门"):
+            it["source_name"] = f"X热门·{it['source_name'].replace('X·', '', 1)}"
+    items.sort(key=lambda x: x["popularity"], reverse=True)
+    return items[:limit], []
+
+
+def fetch_x_topics(
+    mode: str = "following",
+    list_id: str = "",
+    limit: int = 20,
+    auth_token: str = "",
+    ct0: str = "",
+    use_cache: bool = True,
+    search_enabled: bool = True,
+    search_keywords: Optional[List[str]] = None,
+    min_faves: int = 100,
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    """使用用户小号 Cookie（auth_token + ct0）通过 X Web GraphQL 抓取关注流/List + 热门关键词破圈推文。"""
+    if not auth_token or not ct0:
+        from . import settings_store
+        st = settings_store.load_settings()
+        auth_token = auth_token or str(st.get("x_auth_token") or "").strip()
+        ct0 = ct0 or str(st.get("x_ct0") or "").strip()
+    if not auth_token or not ct0:
+        return [], []
+
+    lid = _extract_x_list_id(list_id) if mode == "list" else ""
+    if mode == "list" and not lid:
+        return [], ["请填写有效的 X List 链接或数字 ID"]
+    kws_clean = [str(k).strip() for k in (search_keywords or DEFAULT_X_SEARCH_KEYWORDS) if str(k).strip()][:8]
+    cache_key = f"{mode}:{lid}:{int(bool(search_enabled))}:{'|'.join(kws_clean)}:{int(min_faves or 100)}"
+    now = time.time()
+    if (
+        use_cache
+        and _X_CACHE["items"]
+        and _X_CACHE["key"] == cache_key
+        and (now - _X_CACHE["ts"] < _RSS_CACHE_TTL_SEC)
+    ):
+        return list(_X_CACHE["items"][:limit]), []
+
+    op_name = "ListLatestTweetsTimeline" if (mode == "list" and lid) else "HomeLatestTimeline"
+    needed_ops = [op_name, "SearchTimeline"] if search_enabled else [op_name]
+    headers = {
+        "User-Agent": _UA,
+        "Authorization": _X_WEB_BEARER,
+        "x-csrf-token": ct0,
+        "x-twitter-auth-type": "OAuth2Session",
+        "x-twitter-active-user": "yes",
+        "x-twitter-client-language": "en",
+        "Cookie": f"auth_token={auth_token}; ct0={ct0}",
+        "Referer": f"https://x.com/i/lists/{lid}" if lid else "https://x.com/home",
+    }
+    try:
+        ops = _resolve_x_graphql_ops(auth_token, ct0, needed=needed_ops)
+        op = ops.get(op_name)
+        if not op:
+            return [], [f"未能从 X 前端提取 {op_name} 接口标识"]
+
+        if op_name == "ListLatestTweetsTimeline":
+            variables = {"listId": lid, "count": max(limit, 25)}
+        else:
+            variables = {
+                "count": max(limit, 25),
+                "includePromotedContent": False,
+                "latestControlAvailable": True,
+                "requestContext": "launch",
+            }
+        features = {k: True for k in (op.get("switches") or [])}
+        endpoint = f"https://x.com/i/api/graphql/{op['queryId']}/{op_name}"
+        r = requests.get(
+            endpoint,
+            params={"variables": json.dumps(variables), "features": json.dumps(features)},
+            headers=headers,
+            timeout=15,
+        )
+        # 若 queryId 恰好在 X 发版时轮换，清缓存强制刷新一次再重试
+        if r.status_code == 404:
+            ops = _resolve_x_graphql_ops(auth_token, ct0, needed=needed_ops, force=True)
+            op = ops.get(op_name)
+            if op:
+                endpoint = f"https://x.com/i/api/graphql/{op['queryId']}/{op_name}"
+                features = {k: True for k in (op.get("switches") or [])}
+                r = requests.get(
+                    endpoint,
+                    params={"variables": json.dumps(variables), "features": json.dumps(features)},
+                    headers=headers,
+                    timeout=15,
+                )
+        if r.status_code in (401, 403):
+            return [], [f"X Cookie 已失效或被风控（HTTP {r.status_code}），请重新从浏览器复制 auth_token 与 ct0"]
+        if r.status_code == 429:
+            return [], ["X 请求触发限流（HTTP 429），请稍后再试"]
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and data.get("errors") and not data.get("data"):
+            msg = str((data["errors"][0] or {}).get("message") or data["errors"])
+            return [], [f"X 接口返回错误：{msg[:120]}"]
+        follow_items = _parse_x_graphql_tweets(data)
+        follow_items.sort(key=lambda x: x["popularity"], reverse=True)
+        hot_items: List[Dict[str, Any]] = []
+        errs: List[str] = []
+
+        if search_enabled:
+            try:
+                s_items, s_errs = _fetch_x_search_tweets(
+                    auth_token,
+                    ct0,
+                    ops,
+                    keywords=kws_clean,
+                    min_faves=min_faves,
+                    limit=max(12, limit // 2 + 4),
+                )
+                errs.extend(s_errs)
+                hot_items = s_items
+            except Exception as se:
+                errs.append(f"X 热门搜索失败: {se}")
+
+        # 均衡配额：关注流与热门搜索各取一半保底名额，防超大号把破圈热帖挤出配额
+        half = max(4, limit // 2)
+        seen_urls = set()
+        merged: List[Dict[str, Any]] = []
+
+        def _push(it: Dict[str, Any]) -> None:
+            u = it.get("source_url") or ""
+            if u and u in seen_urls:
+                return
+            if u:
+                seen_urls.add(u)
+            merged.append(it)
+
+        for it in follow_items[:half]:
+            _push(it)
+        for it in hot_items[:half]:
+            _push(it)
+        for it in sorted(follow_items[half:] + hot_items[half:], key=lambda x: x["popularity"], reverse=True):
+            if len(merged) >= limit:
+                break
+            _push(it)
+
+        merged.sort(key=lambda x: x["popularity"], reverse=True)
+        if use_cache and merged:
+            _X_CACHE["ts"] = now
+            _X_CACHE["key"] = cache_key
+            _X_CACHE["items"] = merged
+        return merged[:limit], errs
+    except Exception as e:
+        return [], [f"X 抓取失败: {e}"]
+
+
 def gather_all_sources(
     sources_config: Dict[str, Any],
     search_terms: Optional[List[str]] = None,
@@ -790,6 +1167,7 @@ def gather_all_sources(
         "hf_papers": 0,
         "reddit": 0,
         "bluesky": 0,
+        "x": 0,
         "bilibili": 0,
         "weibo_hot": 0,
         "rss": 0,
@@ -799,7 +1177,7 @@ def gather_all_sources(
     merged_terms = list(dict.fromkeys([*(base_keywords), *(search_terms or [])]))
 
     tasks = {}
-    with ThreadPoolExecutor(max_workers=9) as pool:
+    with ThreadPoolExecutor(max_workers=10) as pool:
         if cfg.get("github_trending", True):
             langs = cfg.get("github_languages") or ["python", "typescript", ""]
             tasks[pool.submit(lambda: (fetch_github_trending(languages=langs, limit=12), []))] = "github_trending"
@@ -813,6 +1191,24 @@ def gather_all_sources(
         if cfg.get("bluesky", True):
             handles = cfg.get("bluesky_accounts") or DEFAULT_BLUESKY_HANDLES
             tasks[pool.submit(fetch_bluesky_topics, handles, 4)] = "bluesky"
+        if cfg.get("x", True):
+            x_mode = str(cfg.get("x_mode") or "following")
+            x_list_id = str(cfg.get("x_list_id") or "")
+            x_search_enabled = bool(cfg.get("x_search_enabled", True))
+            x_search_kws = cfg.get("x_search_keywords") or DEFAULT_X_SEARCH_KEYWORDS
+            x_min_faves = int(cfg.get("x_min_faves") or 100)
+            tasks[pool.submit(
+                fetch_x_topics,
+                x_mode,
+                x_list_id,
+                22,
+                "",
+                "",
+                True,
+                x_search_enabled,
+                x_search_kws,
+                x_min_faves,
+            )] = "x"
         if cfg.get("bilibili", True):
             bili_kws = base_keywords or ["AI工具实操", "一人公司", "Claude Code"]
             tasks[pool.submit(fetch_bilibili_topics, bili_kws, cfg.get("bilibili_accounts") or [], 4)] = "bilibili"

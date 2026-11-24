@@ -70,6 +70,12 @@ interface SourcesConfig {
   reddit_subreddits?: string[]
   bluesky?: boolean
   bluesky_accounts?: string[]
+  x?: boolean
+  x_mode?: 'following' | 'list'
+  x_list_id?: string
+  x_search_enabled?: boolean
+  x_search_keywords?: string[]
+  x_min_faves?: number
   bilibili?: boolean
   bilibili_accounts?: string[]
   weibo_hot?: boolean
@@ -94,6 +100,7 @@ const SOURCE_META: { key: string; cfgKey?: keyof SourcesConfig; label: string; d
   { key: 'hf_papers', cfgKey: 'hf_papers', label: 'HF Daily Papers', desc: '每日高赞 AI 论文' },
   { key: 'reddit', cfgKey: 'reddit', label: 'Reddit AI 社区', desc: 'Arctic Shift 免 Key 热帖' },
   { key: 'bluesky', cfgKey: 'bluesky', label: 'Bluesky 大牛', desc: '免 Key 关注 AI 研究者动态' },
+  { key: 'x', cfgKey: 'x', label: 'X (Twitter)', desc: '关注流 / List + 热门破圈搜索' },
   { key: 'bilibili', cfgKey: 'bilibili', label: 'B站视频', desc: '关键词 + UP主 + 低粉爆款' },
   { key: 'wechat_search', cfgKey: 'wechat_search', label: '搜狗公众号', desc: '微信生态同题文章' },
   { key: 'weibo_hot', cfgKey: 'weibo_hot', label: '微博热搜', desc: 'AI/科技破圈话题' },
@@ -123,6 +130,16 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
   const [newBiliUp, setNewBiliUp] = useState('')
   const [newSubreddit, setNewSubreddit] = useState('')
   const [newBskyHandle, setNewBskyHandle] = useState('')
+  const [xAuthState, setXAuthState] = useState<{ has_x_auth_token?: boolean; x_auth_token_masked?: string; has_x_ct0?: boolean; x_ct0_masked?: string }>({})
+  const [xAuthToken, setXAuthToken] = useState('')
+  const [xCt0, setXCt0] = useState('')
+  const [xMode, setXMode] = useState<'following' | 'list'>('following')
+  const [xListId, setXListId] = useState('')
+  const [xSearchEnabled, setXSearchEnabled] = useState(true)
+  const [xSearchKeywords, setXSearchKeywords] = useState<string[]>(['AI Agent', 'Claude Code', 'OpenAI', 'LLM'])
+  const [xMinFaves, setXMinFaves] = useState(100)
+  const [newXKw, setNewXKw] = useState('')
+  const [xTestRes, setXTestRes] = useState<{ ok: boolean; text: string } | null>(null)
   const [newRssName, setNewRssName] = useState('')
   const [newRssUrl, setNewRssUrl] = useState('')
   const [rssTestRes, setRssTestRes] = useState<{ ok: boolean; text: string } | null>(null)
@@ -141,7 +158,14 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
       const res = await fetch(`${API_BASE}/topics/sources`)
       const d = await res.json()
       if (d.ok) {
-        setSrcCfg(d.sources_config || {})
+        const sc = d.sources_config || {}
+        setSrcCfg(sc)
+        setXMode(sc.x_mode === 'list' ? 'list' : 'following')
+        setXListId(sc.x_list_id || '')
+        setXSearchEnabled(sc.x_search_enabled !== false)
+        setXSearchKeywords(Array.isArray(sc.x_search_keywords) && sc.x_search_keywords.length > 0 ? sc.x_search_keywords : ['AI Agent', 'Claude Code', 'OpenAI', 'LLM'])
+        setXMinFaves(typeof sc.x_min_faves === 'number' && sc.x_min_faves >= 10 ? sc.x_min_faves : 100)
+        if (d.x_auth) setXAuthState(d.x_auth)
         if (d.pool_counts) setSourceCounts(d.pool_counts)
       }
     } catch { /* ignore */ }
@@ -493,6 +517,7 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
     (srcCfg.hf_papers !== false ? 1 : 0) +
     (srcCfg.reddit !== false ? 1 : 0) +
     (srcCfg.bluesky !== false ? 1 : 0) +
+    (srcCfg.x !== false && xAuthState.has_x_auth_token && xAuthState.has_x_ct0 ? 1 : 0) +
     (srcCfg.bilibili !== false ? 1 : 0) +
     (srcCfg.wechat_search !== false ? 1 : 0) +
     (srcCfg.weibo_hot !== false ? 1 : 0) +
@@ -813,6 +838,231 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
                 <button type="button" style={{ ...ghostBtn, padding: '5px 10px', fontSize: 12.5 }} onClick={addBskyHandle}>+ 添加</button>
               </div>
             </div>
+          </div>
+
+          <div style={{ padding: '10px 12px', borderRadius: 9, background: 'rgba(127,127,127,0.05)', marginBottom: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6, flexWrap: 'wrap', gap: 8 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600 }}>
+                X (Twitter) 小号 Cookie 订阅
+                {xAuthState.has_x_auth_token && xAuthState.has_x_ct0 ? (
+                  <span style={{ marginLeft: 8, fontSize: 11.5, color: '#3a9d5d', fontWeight: 500 }}>
+                    ✓ 已保存凭证（auth_token: {xAuthState.x_auth_token_masked} · ct0: {xAuthState.x_ct0_masked}）
+                  </span>
+                ) : (
+                  <span style={{ marginLeft: 8, fontSize: 11.5, opacity: 0.6, fontWeight: 400 }}>
+                    未配置凭证
+                  </span>
+                )}
+              </div>
+              <span style={{ fontSize: 11.5, opacity: 0.6 }}>
+                X 页面按 F12 → Application → Cookies → https://x.com 复制 auth_token 与 ct0
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
+              <select
+                value={xMode}
+                onChange={(e) => setXMode(e.target.value === 'list' ? 'list' : 'following')}
+                style={{ ...inputStyle, width: 'auto', minWidth: 235, padding: '5px 8px', fontSize: 12.5, colorScheme: 'light dark' }}
+              >
+                <option value="following">小号「正在关注」时间线（推荐）</option>
+                <option value="list">指定 X List 列表</option>
+              </select>
+              {xMode === 'list' && (
+                <input
+                  value={xListId}
+                  onChange={(e) => setXListId(e.target.value)}
+                  placeholder="贴入 List 链接或数字 ID（如 https://x.com/i/lists/123...）"
+                  style={{ ...inputStyle, flex: 1, minWidth: 220, padding: '5px 8px', fontSize: 12.5 }}
+                />
+              )}
+              <input
+                type="password"
+                value={xAuthToken}
+                onChange={(e) => { setXAuthToken(e.target.value); setXTestRes(null) }}
+                placeholder={xAuthState.has_x_auth_token ? `auth_token（已保存 ${xAuthState.x_auth_token_masked}，留空沿用）` : '粘贴 auth_token'}
+                style={{ ...inputStyle, flex: 1, minWidth: 200, padding: '5px 8px', fontSize: 12.5 }}
+              />
+              <input
+                type="password"
+                value={xCt0}
+                onChange={(e) => { setXCt0(e.target.value); setXTestRes(null) }}
+                placeholder={xAuthState.has_x_ct0 ? `ct0（已保存 ${xAuthState.x_ct0_masked}，留空沿用）` : '粘贴 ct0'}
+                style={{ ...inputStyle, flex: 1, minWidth: 200, padding: '5px 8px', fontSize: 12.5 }}
+              />
+              <button
+                type="button"
+                style={{ ...ghostBtn, padding: '5px 10px', fontSize: 12.5 }}
+                disabled={srcBusy}
+                onClick={async () => {
+                  setSrcBusy(true)
+                  setXTestRes(null)
+                  try {
+                    const res = await fetch(`${API_BASE}/topics/sources/test-x`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        auth_token: xAuthToken,
+                        ct0: xCt0,
+                        x_mode: xMode,
+                        x_list_id: xListId,
+                        x_search_enabled: xSearchEnabled,
+                        x_search_keywords: xSearchKeywords,
+                        x_min_faves: xMinFaves,
+                      }),
+                    })
+                    const d = await res.json()
+                    if (res.ok && d.ok) {
+                      const first = (d.samples || [])[0]?.title || ''
+                      const detail = typeof d.follow_count === 'number' && typeof d.hot_count === 'number'
+                        ? `关注流 ${d.follow_count} 条 + 热门破圈 ${d.hot_count} 条`
+                        : `共 ${d.count} 条推文`
+                      setXTestRes({ ok: true, text: `✓ 连通成功（${detail}，如：${first.slice(0, 55)}）` })
+                    } else {
+                      setXTestRes({ ok: false, text: `✗ ${d.error || '测试失败'}` })
+                    }
+                  } catch (e) {
+                    setXTestRes({ ok: false, text: `✗ ${e}` })
+                  } finally {
+                    setSrcBusy(false)
+                  }
+                }}
+              >
+                {xAuthToken.trim() || xCt0.trim() ? '测试当前输入' : (xAuthState.has_x_auth_token && xAuthState.has_x_ct0 ? '测试已存凭证' : '测试连通')}
+              </button>
+              <button
+                type="button"
+                style={{ ...goBtn, padding: '5px 12px', fontSize: 12.5 }}
+                disabled={srcBusy}
+                onClick={async () => {
+                  setSrcBusy(true)
+                  try {
+                    const res = await fetch(`${API_BASE}/topics/sources/x-auth`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        auth_token: xAuthToken,
+                        ct0: xCt0,
+                        x_mode: xMode,
+                        x_list_id: xListId,
+                        x_search_enabled: xSearchEnabled,
+                        x_search_keywords: xSearchKeywords,
+                        x_min_faves: xMinFaves,
+                      }),
+                    })
+                    const d = await res.json()
+                    if (d.ok) {
+                      if (d.sources_config) setSrcCfg(d.sources_config)
+                      if (d.x_auth) setXAuthState(d.x_auth)
+                      setXAuthToken('')
+                      setXCt0('')
+                      setMsg('✓ 已保存 X 订阅配置')
+                    }
+                  } catch (e) {
+                    setMsg(`✗ 保存失败：${e}`)
+                  } finally {
+                    setSrcBusy(false)
+                  }
+                }}
+              >
+                保存凭证
+              </button>
+              {(xAuthState.has_x_auth_token || xAuthState.has_x_ct0) && (
+                <button
+                  type="button"
+                  style={{ ...ghostBtn, padding: '5px 9px', fontSize: 12, opacity: 0.75 }}
+                  disabled={srcBusy}
+                  onClick={async () => {
+                    setSrcBusy(true)
+                    try {
+                      const res = await fetch(`${API_BASE}/topics/sources/x-auth`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ clear: true }),
+                      })
+                      const d = await res.json()
+                      if (d.ok) {
+                        if (d.x_auth) setXAuthState(d.x_auth)
+                        setXTestRes(null)
+                        setMsg('已清除 X Cookie 凭证')
+                      }
+                    } finally {
+                      setSrcBusy(false)
+                    }
+                  }}
+                >
+                  清除
+                </button>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: xTestRes ? 6 : 0, paddingTop: 6, borderTop: '1px dashed rgba(127,127,127,0.18)' }}>
+              <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, cursor: 'pointer', fontWeight: 500 }}>
+                <input
+                  type="checkbox"
+                  checked={xSearchEnabled}
+                  onChange={(e) => setXSearchEnabled(e.target.checked)}
+                />
+                热门破圈搜索
+              </label>
+              {xSearchEnabled && (
+                <>
+                  <span style={{ fontSize: 11.5, opacity: 0.65 }}>最低赞</span>
+                  <input
+                    type="number"
+                    min={10}
+                    step={50}
+                    value={xMinFaves}
+                    onChange={(e) => setXMinFaves(Math.max(10, Number(e.target.value) || 100))}
+                    style={{ ...inputStyle, width: 68, padding: '3px 6px', fontSize: 12 }}
+                  />
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, alignItems: 'center', flex: 1 }}>
+                    {xSearchKeywords.map((kw) => (
+                      <span
+                        key={kw}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 4,
+                          padding: '2px 7px',
+                          borderRadius: 999,
+                          fontSize: 11.5,
+                          background: 'rgba(196,167,125,0.15)',
+                          border: '1px solid rgba(196,167,125,0.35)',
+                        }}
+                      >
+                        {kw}
+                        <button
+                          type="button"
+                          onClick={() => setXSearchKeywords((prev) => prev.filter((k) => k !== kw))}
+                          style={{ border: 'none', background: 'none', color: 'inherit', cursor: 'pointer', padding: 0, fontSize: 12, opacity: 0.65 }}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                    <input
+                      value={newXKw}
+                      onChange={(e) => setNewXKw(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          const v = newXKw.trim()
+                          if (v && !xSearchKeywords.includes(v)) {
+                            setXSearchKeywords((prev) => [...prev, v])
+                          }
+                          setNewXKw('')
+                        }
+                      }}
+                      placeholder="加关键词回车"
+                      style={{ ...inputStyle, width: 110, padding: '3px 7px', fontSize: 11.5 }}
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+            {xTestRes && (
+              <div style={{ fontSize: 12, color: xTestRes.ok ? '#3a9d5d' : '#e24b4a' }}>
+                {xTestRes.text}
+              </div>
+            )}
           </div>
 
           <div style={{ padding: '10px 12px', borderRadius: 9, background: 'rgba(127,127,127,0.05)' }}>

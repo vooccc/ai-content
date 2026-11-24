@@ -204,6 +204,7 @@ def cluster_candidates(items: List[Dict[str, Any]], threshold: float = 0.24) -> 
         "hf_papers": "HF论文",
         "reddit": "Reddit",
         "bluesky": "Bluesky",
+        "x": "X",
         "bilibili": "B站",
         "weibo_hot": "微博热搜",
         "wechat_search": "公众号",

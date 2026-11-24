@@ -95,6 +95,7 @@ def list_topics(status: str = "", source_type: str = "", filter: str = "", limit
 def get_topic_sources():
     acc = db.get_primary_account()
     sc = acc.get("sources_config") or {}
+    ms = settings_store.get_masked_settings()
     return {
         "ok": True,
         "sources_config": sc,
@@ -103,6 +104,98 @@ def get_topic_sources():
         "last_rss_stats": sc.get("last_rss_stats") or {},
         "last_fetch_errors": sc.get("last_fetch_errors") or [],
         "last_fetch_at": sc.get("last_fetch_at") or 0,
+        "x_auth": {
+            "has_x_auth_token": bool(ms.get("has_x_auth_token")),
+            "x_auth_token_masked": ms.get("x_auth_token_masked") or "",
+            "has_x_ct0": bool(ms.get("has_x_ct0")),
+            "x_ct0_masked": ms.get("x_ct0_masked") or "",
+        },
+    }
+
+
+class XAuthRequest(BaseModel):
+    auth_token: str = ""
+    ct0: str = ""
+    x_mode: Optional[str] = None
+    x_list_id: Optional[str] = None
+    x_search_enabled: Optional[bool] = None
+    x_search_keywords: Optional[List[str]] = None
+    x_min_faves: Optional[int] = None
+    clear: bool = False
+
+
+@router.post("/topics/sources/x-auth")
+def save_x_auth(req: XAuthRequest):
+    if req.clear:
+        ms = settings_store.update_settings({"clear_x_auth_token": True, "clear_x_ct0": True})
+    else:
+        patch: Dict[str, Any] = {}
+        if req.auth_token.strip() and "****" not in req.auth_token:
+            patch["x_auth_token"] = req.auth_token.strip()
+        if req.ct0.strip() and "****" not in req.ct0:
+            patch["x_ct0"] = req.ct0.strip()
+        ms = settings_store.update_settings(patch) if patch else settings_store.get_masked_settings()
+    acc = db.get_primary_account()
+    sc = dict(acc.get("sources_config") or {})
+    if req.x_mode in ("following", "list"):
+        sc["x_mode"] = req.x_mode
+    if req.x_list_id is not None:
+        sc["x_list_id"] = req.x_list_id.strip()
+    if req.x_search_enabled is not None:
+        sc["x_search_enabled"] = bool(req.x_search_enabled)
+    if req.x_search_keywords is not None:
+        sc["x_search_keywords"] = [str(k).strip() for k in req.x_search_keywords if str(k).strip()][:8]
+    if req.x_min_faves is not None:
+        sc["x_min_faves"] = max(10, int(req.x_min_faves))
+    sc["x"] = True if (ms.get("has_x_auth_token") and ms.get("has_x_ct0")) else sc.get("x", True)
+    updated = db.update_primary_account({"sources_config": sc})
+    return {
+        "ok": True,
+        "sources_config": updated.get("sources_config") or sc,
+        "x_auth": {
+            "has_x_auth_token": bool(ms.get("has_x_auth_token")),
+            "x_auth_token_masked": ms.get("x_auth_token_masked") or "",
+            "has_x_ct0": bool(ms.get("has_x_ct0")),
+            "x_ct0_masked": ms.get("x_ct0_masked") or "",
+        },
+    }
+
+
+@router.post("/topics/sources/test-x")
+def test_x_source(req: XAuthRequest):
+    from . import sources
+    raw_st = settings_store.load_settings()
+    tok = req.auth_token.strip() if (req.auth_token.strip() and "****" not in req.auth_token) else str(raw_st.get("x_auth_token") or "").strip()
+    ct0 = req.ct0.strip() if (req.ct0.strip() and "****" not in req.ct0) else str(raw_st.get("x_ct0") or "").strip()
+    if not tok or not ct0:
+        return JSONResponse({"ok": False, "error": "请先填写 auth_token 和 ct0 Cookie"}, status_code=400)
+    sc = (db.get_primary_account().get("sources_config") or {})
+    mode = req.x_mode if req.x_mode in ("following", "list") else str(sc.get("x_mode") or "following")
+    lid = req.x_list_id if req.x_list_id is not None else str(sc.get("x_list_id") or "")
+    s_enabled = req.x_search_enabled if req.x_search_enabled is not None else bool(sc.get("x_search_enabled", True))
+    s_kws = req.x_search_keywords if req.x_search_keywords is not None else (sc.get("x_search_keywords") or sources.DEFAULT_X_SEARCH_KEYWORDS)
+    s_faves = req.x_min_faves if req.x_min_faves is not None else int(sc.get("x_min_faves") or 100)
+    items, errs = sources.fetch_x_topics(
+        mode=mode,
+        list_id=lid,
+        limit=10,
+        auth_token=tok,
+        ct0=ct0,
+        use_cache=False,
+        search_enabled=s_enabled,
+        search_keywords=s_kws,
+        min_faves=s_faves,
+    )
+    if errs and not items:
+        return JSONResponse({"ok": False, "error": errs[0]}, status_code=400)
+    hot_count = sum(1 for it in items if str(it.get("source_name") or "").startswith("X热门"))
+    follow_count = len(items) - hot_count
+    return {
+        "ok": True,
+        "count": len(items),
+        "follow_count": follow_count,
+        "hot_count": hot_count,
+        "samples": [{"title": it["raw_title"], "url": it["source_url"], "source": it["source_name"]} for it in items[:4]],
     }
 
 

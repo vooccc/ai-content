@@ -36,7 +36,7 @@ def classify_credibility(item: Dict[str, Any]) -> str:
             return "一手官方"
     if len(res_srcs) >= 2 or len({str(s.get("source_type") or "") for s in sigs if s.get("source_type")}) >= 2:
         return "多源印证"
-    if st in ("hackernews", "bilibili", "reddit", "bluesky") or any(
+    if st in ("hackernews", "bilibili", "reddit", "bluesky", "x") or any(
         k in sn for k in ("simon willison", "latent space", "少数派", "阮一峰")
     ):
         return "社区热议"

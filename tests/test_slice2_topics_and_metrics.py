@@ -571,6 +571,120 @@ class TestSlice2TopicsAndMetrics(unittest.TestCase):
         trimmed = sources.trim_clean("An open source autonomous coding assistant framework", 28)
         self.assertFalse(trimmed.endswith("autono…"))
 
+    def test_x_cookie_masked_storage_and_parser(self):
+        from fastapi.testclient import TestClient
+        from server import sources, settings_store
+        from server.app import app
+
+        client = TestClient(app)
+        # 1. 保存 X Cookie 后，GET /topics/sources 只返回脱敏占位，绝不回传明文
+        r = client.post("/topics/sources/x-auth", json={
+            "auth_token": "secret_auth_token_1234567890",
+            "ct0": "secret_ct0_abcdef1234567890",
+            "x_mode": "following",
+        })
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["x_auth"]["has_x_auth_token"])
+        self.assertIn("****", body["x_auth"]["x_auth_token_masked"])
+        self.assertNotIn("secret_auth_token_1234567890", str(body))
+        self.assertEqual(settings_store.load_settings()["x_auth_token"], "secret_auth_token_1234567890")
+
+        # 2. 测试 _parse_x_graphql_tweets 过滤纯转发并解析原创/长推文
+        fake_gql = {
+            "data": {
+                "home": {
+                    "home_timeline_urt": {
+                        "instructions": [
+                            {
+                                "entries": [
+                                    {
+                                        "content": {
+                                            "itemContent": {
+                                                "tweet_results": {
+                                                    "result": {
+                                                        "__typename": "Tweet",
+                                                        "rest_id": "1001",
+                                                        "core": {"user_results": {"result": {"core": {"screen_name": "enzjjq", "name": "John"}}}},
+                                                        "legacy": {
+                                                            "id_str": "1001",
+                                                            "full_text": "RT @someone: pure retweet should be skipped",
+                                                            "retweeted_status_result": {"result": {}},
+                                                            "is_quote_status": False,
+                                                        },
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    {
+                                        "content": {
+                                            "itemContent": {
+                                                "tweet_results": {
+                                                    "result": {
+                                                        "__typename": "TweetWithVisibilityResults",
+                                                        "tweet": {
+                                                            "rest_id": "1002",
+                                                            "core": {"user_results": {"result": {"core": {"screen_name": "karpathy", "name": "Andrej Karpathy"}}}},
+                                                            "note_tweet": {
+                                                                "note_tweet_results": {
+                                                                    "result": {"text": "Released Claude Code multi-agent workflow benchmark today https://t.co/abc"}
+                                                                }
+                                                            },
+                                                            "legacy": {
+                                                                "id_str": "1002",
+                                                                "full_text": "short truncated",
+                                                                "favorite_count": 420,
+                                                                "retweet_count": 85,
+                                                                "reply_count": 19,
+                                                                "entities": {"urls": [{"expanded_url": "https://github.com/karpathy/demo"}]},
+                                                            },
+                                                        },
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        parsed = sources._parse_x_graphql_tweets(fake_gql)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["source_type"], "x")
+        self.assertIn("@karpathy", parsed[0]["raw_title"])
+        self.assertIn("https://github.com/karpathy/demo", parsed[0]["raw_summary"])
+
+        # 3. 测试 _build_x_search_query 与 /topics/sources/test-x mock 401/200（含 SearchTimeline POST）
+        q_str = sources._build_x_search_query(["AI Agent", "Claude Code"], min_faves=150, days=4)
+        self.assertIn('"AI Agent" OR "Claude Code"', q_str)
+        self.assertIn("min_faves:150", q_str)
+        self.assertIn("since:", q_str)
+        self.assertIn("-filter:retweets", q_str)
+
+        with patch("server.sources._resolve_x_graphql_ops", return_value={
+            "HomeLatestTimeline": {"queryId": "QID123", "switches": ["s1"]},
+            "SearchTimeline": {"queryId": "QID456", "switches": ["s2"]},
+        }), patch("server.sources.requests.get") as mget, patch("server.sources.requests.post") as mpost:
+            mget.return_value.status_code = 401
+            res401 = client.post("/topics/sources/test-x", json={})
+            self.assertEqual(res401.status_code, 400)
+            self.assertIn("401", res401.json()["error"])
+
+            mget.return_value.status_code = 200
+            mget.return_value.raise_for_status = lambda: None
+            mget.return_value.json.return_value = fake_gql
+            mpost.return_value.status_code = 200
+            mpost.return_value.raise_for_status = lambda: None
+            mpost.return_value.json.return_value = fake_gql
+            res200 = client.post("/topics/sources/test-x", json={"x_search_enabled": True, "x_min_faves": 200})
+            self.assertEqual(res200.status_code, 200)
+            self.assertEqual(res200.json()["count"], 1)  # 同 URL 去重合并
+            self.assertTrue(mpost.called)
+
 
 if __name__ == "__main__":
     unittest.main()
