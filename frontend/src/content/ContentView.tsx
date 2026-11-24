@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Moon, PanelLeftClose, PanelLeftOpen, Sun } from 'lucide-react'
+import { useState, type ReactNode } from 'react'
+import { BarChart3, Lightbulb, Moon, PanelLeftClose, PanelLeftOpen, PenLine, Settings, Sun, Zap } from 'lucide-react'
 import TopicsView from './TopicsView'
 import IntelView from './IntelView'
 import StudioShell from './studio/StudioShell'
@@ -13,12 +13,12 @@ interface ContentViewProps {
 
 type NavTab = 'intel' | 'topics' | 'studio' | 'publish' | 'metrics'
 
-const NAV_ITEMS: { key: NavTab; icon: string; label: string }[] = [
-  { key: 'intel', icon: '⚡', label: '实时快讯' },
-  { key: 'topics', icon: '💡', label: '选题池' },
-  { key: 'studio', icon: '✍️', label: '创作台' },
-  { key: 'publish', icon: '📤', label: '账号与设置' },
-  { key: 'metrics', icon: '📊', label: '数据复盘' },
+const NAV_ITEMS: { key: NavTab; icon: ReactNode; label: string }[] = [
+  { key: 'intel', icon: <Zap size={15} strokeWidth={1.9} />, label: '实时快讯' },
+  { key: 'topics', icon: <Lightbulb size={15} strokeWidth={1.9} />, label: '选题池' },
+  { key: 'studio', icon: <PenLine size={15} strokeWidth={1.9} />, label: '创作台' },
+  { key: 'publish', icon: <Settings size={15} strokeWidth={1.9} />, label: '账号与设置' },
+  { key: 'metrics', icon: <BarChart3 size={15} strokeWidth={1.9} />, label: '数据复盘' },
 ]
 
 export default function ContentView({ theme = 'dark', onToggleTheme }: ContentViewProps) {
@@ -139,7 +139,7 @@ export default function ContentView({ theme = 'dark', onToggleTheme }: ContentVi
                   textAlign: 'left',
                 }}
               >
-                <span style={{ fontSize: 15, lineHeight: 1 }}>{item.icon}</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', opacity: active ? 1 : 0.78 }}>{item.icon}</span>
                 {!collapsed && <span>{item.label}</span>}
               </button>
             )

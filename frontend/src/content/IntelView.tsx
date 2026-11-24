@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react'
+import { Flame, Languages, RefreshCw } from 'lucide-react'
+import EngagementMetrics from './EngagementMetrics'
 
 const API_BASE = ((import.meta as unknown as { env?: Record<string, string> }).env?.VITE_CONTENT_API_BASE || '').replace(/\/$/, '')
 
@@ -271,12 +273,24 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
             搜索
           </button>
           {items.some((x) => !/[\u4e00-\u9fff]/.test(x.title || '')) && (
-            <button type="button" style={{ ...ghostBtn, borderColor: 'rgba(90,169,230,0.65)' }} disabled={translating} onClick={translatePending}>
-              {translating ? '翻译中…' : `🌐 翻译英文 (${items.filter((x) => !/[\u4e00-\u9fff]/.test(x.title || '')).length})`}
+            <button
+              type="button"
+              style={{ ...ghostBtn, borderColor: 'rgba(90,169,230,0.65)', display: 'inline-flex', alignItems: 'center', gap: 5 }}
+              disabled={translating}
+              onClick={translatePending}
+            >
+              <Languages size={13} />
+              <span>{translating ? '翻译中…' : `翻译英文 (${items.filter((x) => !/[\u4e00-\u9fff]/.test(x.title || '')).length})`}</span>
             </button>
           )}
-          <button type="button" style={goBtn} disabled={refreshing} onClick={refreshNow}>
-            {refreshing ? '采集提炼中…' : '🔄 刷新快讯'}
+          <button
+            type="button"
+            style={{ ...goBtn, display: 'inline-flex', alignItems: 'center', gap: 5 }}
+            disabled={refreshing}
+            onClick={refreshNow}
+          >
+            <RefreshCw size={13} />
+            <span>{refreshing ? '采集提炼中…' : '刷新快讯'}</span>
           </button>
         </div>
       </div>
@@ -340,6 +354,9 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
               {it.metrics_badge && (
                 <span
                   style={{
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
                     fontSize: 11.5,
                     fontWeight: 600,
                     padding: '2px 8px',
@@ -348,23 +365,12 @@ export default function IntelView({ onOpenProject, onGoTopics }: IntelViewProps)
                     color: '#e24b4a',
                   }}
                 >
-                  🚀 {it.metrics_badge}
+                  <Flame size={12} strokeWidth={2.2} />
+                  <span>{it.metrics_badge}</span>
                 </span>
               )}
-              {it.engagement_badge && (
-                <span
-                  title="小红书互动数据（点赞 · 收藏 · 评论）"
-                  style={{
-                    fontSize: 11.5,
-                    fontWeight: 600,
-                    padding: '2px 8px',
-                    borderRadius: 6,
-                    background: 'rgba(218,165,32,0.14)',
-                    color: '#c48f16',
-                  }}
-                >
-                  {it.engagement_badge}
-                </span>
+              {(it.engagement_badge || it.engagement) && (
+                <EngagementMetrics engagement={it.engagement} badge={it.engagement_badge} />
               )}
               {sigs.length > 1 && (
                 <span style={{ fontSize: 11.5, opacity: 0.7 }}>

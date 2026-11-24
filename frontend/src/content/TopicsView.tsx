@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
+import { Flame, Plus, Radio, RefreshCw, RotateCcw, Sparkles, Upload } from 'lucide-react'
 import { API_BASE } from '../api/base'
+import EngagementMetrics from './EngagementMetrics'
 
 interface RawSignal {
   source_type: string
@@ -632,19 +634,36 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <button
             type="button"
-            style={showSources ? pillBtn(true) : ghostBtn}
+            style={{ ...(showSources ? pillBtn(true) : ghostBtn), display: 'inline-flex', alignItems: 'center', gap: 5 }}
             onClick={() => { setShowSources((v) => !v); setShowImport(false); setShowManual(false) }}
           >
-            📡 信息源 ({activePlatformCount})
+            <Radio size={13} />
+            <span>信息源 ({activePlatformCount})</span>
           </button>
-          <button type="button" style={ghostBtn} onClick={() => { setShowImport((v) => !v); setShowManual(false); setShowSources(false) }}>
-            📥 导入清单
+          <button
+            type="button"
+            style={{ ...ghostBtn, display: 'inline-flex', alignItems: 'center', gap: 5 }}
+            onClick={() => { setShowImport((v) => !v); setShowManual(false); setShowSources(false) }}
+          >
+            <Upload size={13} />
+            <span>导入清单</span>
           </button>
-          <button type="button" style={ghostBtn} onClick={() => { setShowManual((v) => !v); setShowImport(false); setShowSources(false) }}>
-            + 投喂灵感
+          <button
+            type="button"
+            style={{ ...ghostBtn, display: 'inline-flex', alignItems: 'center', gap: 5 }}
+            onClick={() => { setShowManual((v) => !v); setShowImport(false); setShowSources(false) }}
+          >
+            <Plus size={13} />
+            <span>投喂灵感</span>
           </button>
-          <button type="button" style={goBtn} disabled={refreshing} onClick={refreshNow}>
-            {refreshing ? '抓取筛选中…' : '🔄 抓取新选题'}
+          <button
+            type="button"
+            style={{ ...goBtn, display: 'inline-flex', alignItems: 'center', gap: 5 }}
+            disabled={refreshing}
+            onClick={refreshNow}
+          >
+            <RefreshCw size={13} />
+            <span>{refreshing ? '抓取筛选中…' : '抓取新选题'}</span>
           </button>
         </div>
       </div>
@@ -652,8 +671,9 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
       {showSources && (
         <div style={{ ...card, borderColor: 'rgba(196,167,125,0.55)' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, flexWrap: 'wrap', gap: 8 }}>
-            <div style={{ fontSize: 13.5, fontWeight: 600 }}>
-              📡 信息源配置与分布（点击任意来源可筛选，开关改动自动保存）
+            <div style={{ fontSize: 13.5, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <Radio size={14} />
+              <span>信息源配置与分布（点击任意来源可筛选，开关改动自动保存）</span>
             </div>
             <div style={{ fontSize: 12, opacity: 0.65 }}>
               {srcCfg.last_fetch_at
@@ -1572,17 +1592,13 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
                 {t.source_name || t.source_type}
               </button>
               {t.metrics_badge && (
-                <span style={{ fontSize: 11.5, fontWeight: 600, padding: '2px 7px', borderRadius: 6, background: 'rgba(226,75,74,0.15)', color: '#e24b4a' }}>
-                  🚀 {t.metrics_badge}
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11.5, fontWeight: 600, padding: '2px 7px', borderRadius: 6, background: 'rgba(226,75,74,0.15)', color: '#e24b4a' }}>
+                  <Flame size={12} strokeWidth={2.2} />
+                  <span>{t.metrics_badge}</span>
                 </span>
               )}
-              {t.engagement_badge && (
-                <span
-                  title="小红书互动数据（点赞 · 收藏 · 评论）"
-                  style={{ fontSize: 11.5, fontWeight: 600, padding: '2px 7px', borderRadius: 6, background: 'rgba(218,165,32,0.14)', color: '#c48f16' }}
-                >
-                  {t.engagement_badge}
-                </span>
+              {(t.engagement_badge || t.engagement) && (
+                <EngagementMetrics engagement={t.engagement} badge={t.engagement_badge} />
               )}
               {t.source_type === 'xiaohongshu' && !(t.engagement?.collects || t.engagement?.comments) && (
                 <button
@@ -1596,8 +1612,9 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
                 </button>
               )}
               {t.reason?.includes('多源共振') && (
-                <span style={{ fontSize: 11.5, fontWeight: 600, padding: '2px 7px', borderRadius: 6, background: 'rgba(237,123,47,0.16)', color: '#ed7b2f' }}>
-                  🔥 多源共振
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11.5, fontWeight: 600, padding: '2px 7px', borderRadius: 6, background: 'rgba(237,123,47,0.16)', color: '#ed7b2f' }}>
+                  <Sparkles size={12} strokeWidth={2} />
+                  <span>多源共振</span>
                 </span>
               )}
               {t.category && (
@@ -1624,7 +1641,10 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
               )}
               <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
                 {t.status === 'ignored' ? (
-                  <button type="button" style={ghostBtn} onClick={() => setTopicStatus(t, 'new')}>↩️ 恢复</button>
+                  <button type="button" style={{ ...ghostBtn, display: 'inline-flex', alignItems: 'center', gap: 4 }} onClick={() => setTopicStatus(t, 'new')}>
+                    <RotateCcw size={12} />
+                    <span>恢复</span>
+                  </button>
                 ) : t.status !== 'drafted' ? (
                   <button type="button" style={{ ...ghostBtn, opacity: 0.7 }} onClick={() => setTopicStatus(t, 'ignored')}>忽略</button>
                 ) : null}
@@ -1681,9 +1701,14 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
             </div>
 
             {(t.reason || t.angle) && (
-              <div style={{ fontSize: 12.5, opacity: 0.75, lineHeight: 1.6 }}>
-                {t.reason && <span>💡 {t.reason}</span>}
-                {t.reason && t.angle && <span> · </span>}
+              <div style={{ fontSize: 12.5, opacity: 0.75, lineHeight: 1.6, display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
+                {t.reason && (
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <Sparkles size={12} style={{ opacity: 0.75, flexShrink: 0 }} />
+                    <span>{t.reason}</span>
+                  </span>
+                )}
+                {t.reason && t.angle && <span>·</span>}
                 {t.angle && <span>切入：{t.angle}</span>}
               </div>
             )}
