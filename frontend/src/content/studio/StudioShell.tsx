@@ -165,6 +165,33 @@ export default function StudioShell({ openProjectId, onConsumedOpenProject }: St
     } catch { /* ignore */ }
   }
 
+  async function renameCurrent(newTitle: string): Promise<boolean> {
+    if (!proj) return false
+    const nt = newTitle.trim()
+    if (!nt) return false
+    try {
+      const d = await (await fetch(`${API_BASE}/studio/projects/${proj.id}/rename`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: nt }),
+      })).json()
+      if (d.ok && d.title) {
+        setProj((prev) => (prev ? {
+          ...prev,
+          title: d.title,
+          inputs: { ...(prev.inputs || {}), topic: d.title },
+          state: { ...(prev.state || {}), topic: d.title },
+        } : prev))
+        setMsg(`✓ 标题已更新：${d.title}`)
+        loadList()
+        return true
+      }
+      setMsg(`✗ 改标题失败：${d.error || '未知错误'}`)
+    } catch (e) {
+      setMsg(`✗ 改标题失败：${e}`)
+    }
+    return false
+  }
+
   async function openProject(id: string, keepSel = false) {
     const d = await (await fetch(`${API_BASE}/studio/projects/${id}`)).json()
     if (d.ok) {
@@ -363,7 +390,7 @@ export default function StudioShell({ openProjectId, onConsumedOpenProject }: St
     imgModels, imgPick, setImgPick, txtModels, txtPick, setTxtPick,
     defaultModelName,
     styleList, stylePick, setStylePick, themeList, themePick, setThemePick, stepModels, setStepModels,
-    openProject, runStep, saveSettings, openEditor, loadList,
+    openProject, runStep, saveSettings, renameCurrent, openEditor, loadList,
   }
   return (
     <>
@@ -428,6 +455,7 @@ export interface WorkbenchProps {
   openProject: (id: string, keepSel?: boolean) => Promise<void>
   runStep: (i: number, opts?: { feedback?: string; nodeModel?: string; onDelta?: (t: string) => void; onReason?: (t: string) => void; onImage?: (ev: { type: string; [k: string]: unknown }) => void }) => Promise<{ ok: boolean; error?: string }>
   saveSettings: (s: { model?: string; style?: string; theme?: string; step_models?: Record<string, string> }) => Promise<void>
+  renameCurrent: (title: string) => Promise<boolean>
   openEditor: () => void
   loadList: () => void
   onBack: () => void

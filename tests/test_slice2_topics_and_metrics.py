@@ -966,6 +966,258 @@ class TestSlice2TopicsAndMetrics(unittest.TestCase):
         self.assertEqual(promoted["topic"]["engagement_badge"], "👍 2.5万 · ⭐ 8900 · 💬 650")
         self.assertEqual(promoted["topic"]["engagement"]["comments"], 650)
 
+    def test_fetch_wechat_url_and_create_manual_topic(self):
+        from unittest.mock import patch
+        from server import db, search_gather, topic_engine
+
+        fake_html = """
+        <html><head><meta property="og:title" content="Gemini 4 Neon 实操指南" />
+        <meta property="og:article:author" content="测试科技号" /></head>
+        <body><div id="js_content"><p>第一步打开控制台创建工作区，配置环境变量。</p><p>第二步运行自动化测试并对比耗时与准确率。</p></div></body></html>
+        """
+
+        class _FakeResp:
+            status_code = 200
+            encoding = "utf-8"
+            apparent_encoding = "utf-8"
+            text = fake_html
+
+        with patch.object(search_gather.requests, "get", return_value=_FakeResp()), \
+             patch.object(topic_engine, "_score_and_rewrite_with_llm", return_value=None):
+            tp = topic_engine.create_manual_topic("", "https://mp.weixin.qq.com/s/test123")
+            self.assertEqual(tp["source_type"], "manual")
+            self.assertEqual(tp["source_name"], "灵感投喂·测试科技号")
+            self.assertEqual(tp["raw_title"], "Gemini 4 Neon 实操指南")
+            self.assertIn("第一步打开控制台", tp["raw_summary"])
+            self.assertGreaterEqual(tp["score"], 95)
+
+            # 只粘 URL 到第一行 idea 框也同样识别并抓标题
+            tp2 = topic_engine.create_manual_topic("https://mp.weixin.qq.com/s/test123", "")
+            self.assertEqual(tp2["raw_title"], "Gemini 4 Neon 实操指南")
+            self.assertEqual(tp2["source_url"], "https://mp.weixin.qq.com/s/test123")
+
+    def test_llm_bridge_anthropic_transport_and_tag_filter(self):
+        from unittest.mock import patch
+        from server import llm_bridge
+
+        fake_providers = {
+            "p_anth": {
+                "name": "8yes",
+                "enabled": True,
+                "transport": "anthropic_messages",
+                "base_url": "https://api.example.com/v1",
+                "api_key": "sk-anth-test",
+                "models": [
+                    {"id": "claude-opus-5-5", "name": "claude-opus-5-5", "tags": ["vision"]},
+                ],
+            },
+            "p_sf": {
+                "name": "SiliconFlow",
+                "enabled": True,
+                "transport": "openai_chat",
+                "base_url": "https://api.siliconflow.cn/v1",
+                "api_key": "sk-sf",
+                "models": [
+                    {"id": "BAAI/bge-m3", "tags": ["embedding"]},
+                    {"id": "FunAudioLLM/CosyVoice2-0.5B", "tags": ["audio"]},
+                    {"id": "deepseek-v4-chat", "tags": ["chat"]},
+                ],
+            },
+        }
+        self.assertEqual(
+            llm_bridge._normalize_anthropic_messages_url("https://api.example.com/v1"),
+            "https://api.example.com/v1/messages",
+        )
+        self.assertEqual(
+            llm_bridge._normalize_anthropic_messages_url("https://api.example.com/anthropic/v1#"),
+            "https://api.example.com/anthropic/v1/messages",
+        )
+
+        captured = {}
+
+        class _FakeHttpxResp:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"content": [{"type": "text", "text": "OK"}]}
+
+        def _fake_post(url, headers=None, json=None, timeout=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return _FakeHttpxResp()
+
+        with patch.object(llm_bridge, "_load_gateway_cfg", return_value=None), \
+             patch.object(llm_bridge, "_load_custom_cfg", return_value=None), \
+             patch.object(llm_bridge, "_load_providers_raw", return_value=(fake_providers, "claude-opus-5-5")), \
+             patch.object(llm_bridge.httpx, "post", side_effect=_fake_post):
+            models = llm_bridge.list_text_models()
+            ids = [m["model"] for m in models]
+            self.assertIn("claude-opus-5-5", ids)
+            self.assertIn("deepseek-v4-chat", ids)
+            self.assertNotIn("BAAI/bge-m3", ids)
+            self.assertNotIn("FunAudioLLM/CosyVoice2-0.5B", ids)
+
+            reply, used = llm_bridge.chat_completion_with_meta(
+                [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"}],
+                model="claude-opus-5-5",
+            )
+            self.assertEqual(reply, "OK")
+            self.assertEqual(used, "claude-opus-5-5")
+            self.assertEqual(captured["url"], "https://api.example.com/v1/messages")
+            self.assertEqual(captured["headers"]["x-api-key"], "sk-anth-test")
+            self.assertEqual(captured["json"]["system"], "sys")
+            self.assertEqual(captured["json"]["messages"], [{"role": "user", "content": "hi"}])
+
+    def test_topic_project_sets_wf_and_anthropic_stream_client(self):
+        import json
+        from unittest.mock import patch
+        from server import db, topic_routes, studio_routes
+        from ai.llm_client import LLMClient
+
+        tp = db.insert_topic({
+            "source_type": "manual",
+            "source_name": "灵感投喂",
+            "raw_title": "测试选题 _wf 注入",
+            "raw_summary": "测试正文内容",
+            "suggested_titles": ["测试标题 A"],
+            "score": 99,
+        })
+        created = topic_routes._create_project_from_topic(tp["id"], selected_title="测试标题 A")
+        proj = created["project"]
+        self.assertEqual(proj["state"]["_wf"], "content_pipeline")
+
+        pfile = studio_routes._project_path(proj["id"])
+        raw = json.loads(pfile.read_text(encoding="utf-8"))
+        raw["state"].pop("_wf", None)
+        pfile.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+        reloaded = studio_routes._load(proj["id"])
+        self.assertEqual(reloaded["state"]["_wf"], "content_pipeline")
+
+        class _FakeStreamResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self):
+                return [
+                    b'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"plan"}}',
+                    b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}',
+                    b'data: {"type":"message_stop"}',
+                ]
+
+        client = LLMClient(
+            base_url="https://api.example.com/v1",
+            api_key="sk-anth",
+            model="gpt-6.2-sol",
+            transport="anthropic_messages",
+        )
+        with patch("ai.llm_client.requests.post", return_value=_FakeStreamResp()) as mpost:
+            chunks = list(client.chat_stream("hi", system="sys"))
+            self.assertEqual(chunks, [("reasoning", "plan"), ("content", "hello")])
+            self.assertEqual(mpost.call_args.args[0], "https://api.example.com/v1/messages")
+            self.assertEqual(mpost.call_args.headers if False else mpost.call_args.kwargs["headers"]["x-api-key"], "sk-anth")
+
+    def test_rename_syncs_state_topic_and_manual_keeps_full_text(self):
+        from server import search_gather, studio_routes, topic_engine
+
+        long_body = "核心实操步骤详解：" + ("第一段详细配置流程与参数说明。\n" * 250)
+        fake_html = f"""
+        <html><head>
+          <meta property="og:title" content="长文完整抓测试" />
+        </head><body>
+          <div id="js_content"><p>{long_body}</p></div>
+        </body></html>
+        """
+        fake_resp = MagicMock()
+        fake_resp.status_code = 200
+        fake_resp.text = fake_html
+        fake_resp.apparent_encoding = "utf-8"
+        fake_resp.encoding = "utf-8"
+
+        with patch("server.search_gather.requests.get", return_value=fake_resp), patch(
+            "server.topic_engine._score_and_rewrite_with_llm", return_value=None
+        ):
+            tp = topic_engine.create_manual_topic("", "https://mp.weixin.qq.com/s/long-article")
+            self.assertGreater(len(tp["raw_summary"]), 3000)
+
+        import asyncio
+        created = asyncio.run(
+            studio_routes.new_project(
+                studio_routes.NewProjectRequest(
+                    workflow="content_pipeline",
+                    inputs={"topic": "旧标题", "platform": "微信公众号"},
+                    title="旧标题",
+                )
+            )
+        )
+        pid = created["project"]["id"]
+        res = studio_routes.rename_project(pid, studio_routes.RenameRequest(title="新改好的标题"))
+        self.assertTrue(res["ok"])
+        loaded = studio_routes.get_project(pid)["project"]
+        self.assertEqual(loaded["title"], "新改好的标题")
+        self.assertEqual(loaded["inputs"]["topic"], "新改好的标题")
+        self.assertEqual(loaded["state"]["topic"], "新改好的标题")
+
+    def test_hybrid_merges_liuruyan_pro_gateway_models_without_hijacking_default(self):
+        from server import llm_bridge
+
+        mp = Path(self.tmp.name) / "models.json"
+        mp.write_text(
+            json.dumps(
+                {
+                    "current_model": "gemini-4-hydrogen-high",
+                    "providers": {
+                        "p_direct": {
+                            "name": "Direct",
+                            "enabled": True,
+                            "transport": "openai_chat",
+                            "base_url": "https://direct.example/v1",
+                            "api_key": "sk-direct",
+                            "models": [{"id": "gpt-6.2-astra", "name": "GPT 6.2 Astra"}],
+                        }
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        fake_pro = [
+            {
+                "model": "google-antigravity:gemini-4-hydrogen-high",
+                "name": "Gemini 4 Hydrogen High",
+                "provider": "google-antigravity",
+                "provider_name": "Google Antigravity (柳如烟)",
+            }
+        ]
+        with patch(
+            "server.llm_bridge._discover_liuruyan_pro_models",
+            return_value=("http://127.0.0.1:8002/gateway/v1", "lry_gw_tok", fake_pro),
+        ):
+            ms = llm_bridge.list_text_models()
+            ids = [m["model"] for m in ms]
+            self.assertIn("gpt-6.2-astra", ids)
+            self.assertIn("google-antigravity:gemini-4-hydrogen-high", ids)
+
+            cat_def = llm_bridge.build_model_catalog()
+            self.assertEqual(cat_def["default"], "gpt-6.2-astra")
+            self.assertEqual(
+                cat_def["models"]["google-antigravity:gemini-4-hydrogen-high"]["base_url"],
+                "http://127.0.0.1:8002/gateway/v1",
+            )
+
+            cat_sel = llm_bridge.build_model_catalog("google-antigravity:gemini-4-hydrogen-high")
+            self.assertEqual(cat_sel["default"], "google-antigravity:gemini-4-hydrogen-high")
+
 
 if __name__ == "__main__":
     unittest.main()
+

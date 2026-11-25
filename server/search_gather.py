@@ -7,12 +7,15 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
+from html.parser import HTMLParser
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+import requests
 
 from .paths import find_tavily_api_key
 
@@ -96,6 +99,141 @@ async def _extract_article(url: str, max_chars: int = 1200) -> str:
     except Exception:
         pass
     return _extract_regex(html, max_chars)
+
+
+class _WeChatContentParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_js_content = False
+        self.div_depth = 0
+        self.skip_depth = 0
+        self.chunks: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attr_map = {k.lower(): (v or "") for k, v in attrs}
+        t = tag.lower()
+        if not self.in_js_content:
+            if attr_map.get("id") == "js_content":
+                self.in_js_content = True
+                self.div_depth = 1 if t == "div" else 0
+            return
+        if t == "div":
+            self.div_depth += 1
+        if t in ("script", "style", "noscript", "svg"):
+            self.skip_depth += 1
+        elif t in ("p", "br", "li", "h1", "h2", "h3", "h4", "section", "blockquote") and self.skip_depth == 0:
+            self.chunks.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.in_js_content:
+            return
+        t = tag.lower()
+        if t in ("script", "style", "noscript", "svg") and self.skip_depth > 0:
+            self.skip_depth -= 1
+        if t == "div":
+            self.div_depth -= 1
+            if self.div_depth <= 0:
+                self.in_js_content = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_js_content and self.skip_depth == 0:
+            s = re.sub(r"\s+", " ", data)
+            if s.strip():
+                self.chunks.append(s)
+
+
+def _extract_html_title(raw_html: str) -> str:
+    for pat in (
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
+        r'<h1[^>]*id=["\']activity-name["\'][^>]*>(.*?)</h1>',
+        r"<title[^>]*>(.*?)</title>",
+    ):
+        m = re.search(pat, raw_html, flags=re.S | re.I)
+        if m:
+            txt = re.sub(r"<[^>]+>", "", m.group(1))
+            txt = html_lib.unescape(re.sub(r"\s+", " ", txt)).strip()
+            if txt:
+                return txt
+    return ""
+
+
+def _extract_wechat_article(raw_html: str, max_chars: int = 2400) -> Dict[str, str]:
+    title = _extract_html_title(raw_html)
+    author = ""
+    for pat in (
+        r'<meta[^>]+property=["\']og:article:author["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<a[^>]*id=["\']js_name["\'][^>]*>(.*?)</a>',
+        r'var\s+nickname\s*=\s*htmlDecode\("([^"]+)"\)',
+    ):
+        m = re.search(pat, raw_html, flags=re.S | re.I)
+        if m:
+            author = html_lib.unescape(re.sub(r"<[^>]+>", "", m.group(1))).strip()
+            if author:
+                break
+    parser = _WeChatContentParser()
+    try:
+        parser.feed(raw_html)
+        parser.close()
+    except Exception:
+        pass
+    raw_body = "".join(parser.chunks)
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_body.splitlines()]
+    content = "\n".join(ln for ln in lines if ln)[:max_chars]
+    if len(content) < 60:
+        content = _extract_regex(raw_html, max_chars)
+    return {"title": title, "author": author, "content": content}
+
+
+def fetch_url_text(url: str, max_chars: int = 15000) -> Dict[str, Any]:
+    """同步抓取网页标题、作者与正文摘要，专为公众号/博客/新闻链接投喂使用。"""
+    u = (url or "").strip()
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return {"ok": False, "error": "无效 URL"}
+    try:
+        r = requests.get(
+            u,
+            headers={
+                "User-Agent": _UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+            timeout=15,
+            allow_redirects=True,
+        )
+        if r.status_code != 200:
+            return {"ok": False, "error": f"HTTP {r.status_code}"}
+        r.encoding = r.apparent_encoding or r.encoding or "utf-8"
+        raw_html = r.text or ""
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    if "mp.weixin.qq.com" in u.lower():
+        wx = _extract_wechat_article(raw_html, max_chars=max_chars)
+        return {
+            "ok": bool(wx["title"] or wx["content"]),
+            "url": u,
+            "title": wx["title"],
+            "author": wx["author"],
+            "content": wx["content"],
+        }
+
+    title = _extract_html_title(raw_html)
+    content = ""
+    try:
+        import trafilatura
+        content = (trafilatura.extract(raw_html, output_format="markdown", include_comments=False, include_tables=True) or "").strip()
+    except Exception:
+        content = ""
+    if len(content) < 80:
+        content = _extract_regex(raw_html, max_chars)
+    return {
+        "ok": bool(title or content),
+        "url": u,
+        "title": title,
+        "author": "",
+        "content": content[:max_chars],
+    }
 
 
 async def _search_tavily(query: str, limit: int = 6) -> List[Dict]:

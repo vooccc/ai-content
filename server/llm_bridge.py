@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from . import settings_store
-from .paths import gateway_config_path, models_config_paths
+from .paths import gateway_config_path, liuruyan_data_dir, models_config_paths
 
 
 def _load_gateway_cfg() -> Optional[Dict[str, str]]:
@@ -97,6 +99,97 @@ def _load_providers_raw() -> Tuple[Dict[str, Dict[str, Any]], str]:
     return {}, ""
 
 
+_PRO_TRANSPORTS = {"google-antigravity", "compute_account"}
+_PRO_GW_CACHE: Dict[str, Any] = {"ts": 0.0, "base_url": "", "api_key": "", "items": []}
+
+
+def _read_liuruyan_gateway_creds() -> Tuple[bool, str, str]:
+    """只读读取本地柳如烟 Gateway 是否启用及可用令牌（不修改柳如烟数据）。"""
+    st = settings_store.load_settings()
+    custom_url = str(st.get("gateway_url") or "").strip().rstrip("/")
+    custom_tok = str(st.get("gateway_token") or "").strip()
+    lry = liuruyan_data_dir()
+    enabled = True
+    lry_tok = ""
+    if lry:
+        gw_cfg = lry / "gateway_config.json"
+        if gw_cfg.exists():
+            try:
+                enabled = bool(json.loads(gw_cfg.read_text(encoding="utf-8-sig")).get("enabled", False))
+            except Exception:
+                enabled = False
+        tok_file = lry / "gateway_tokens.json"
+        if tok_file.exists():
+            try:
+                raw = json.loads(tok_file.read_text(encoding="utf-8-sig"))
+                for t in (raw.get("tokens") or []):
+                    if isinstance(t, dict) and not t.get("disabled") and (t.get("token") or "").strip():
+                        lry_tok = str(t["token"]).strip()
+                        break
+            except Exception:
+                pass
+    token = custom_tok or lry_tok
+    if not custom_tok and lry_tok:
+        # 若 settings.json 里残留旧端口 (如 8000) 且未配 token，优先自动探测 8002/8000
+        return enabled, custom_url, token
+    return enabled, custom_url, token
+
+
+def _discover_liuruyan_pro_models(force: bool = False) -> Tuple[str, str, List[Dict[str, str]]]:
+    """探测本地柳如烟 Gateway 暴露的算力池模型（如 google-antigravity），20 秒缓存。"""
+    if os.getenv("AICONTENT_DATA_DIR") and not os.getenv("AICONTENT_PRO_GATEWAY_PROBE"):
+        return "", "", []
+    now = time.time()
+    if not force and (now - float(_PRO_GW_CACHE.get("ts") or 0.0)) < 20.0:
+        return (
+            str(_PRO_GW_CACHE.get("base_url") or ""),
+            str(_PRO_GW_CACHE.get("api_key") or ""),
+            list(_PRO_GW_CACHE.get("items") or []),
+        )
+    enabled, cfg_url, token = _read_liuruyan_gateway_creds()
+    if not enabled or not token:
+        _PRO_GW_CACHE.update({"ts": now, "base_url": "", "api_key": "", "items": []})
+        return "", "", []
+
+    candidates: List[str] = []
+    for u in ("http://127.0.0.1:8002/gateway/v1", "http://127.0.0.1:8000/gateway/v1", cfg_url):
+        clean = (u or "").strip().rstrip("/")
+        if clean and clean not in candidates:
+            candidates.append(clean)
+
+    headers = {"Authorization": f"Bearer {token}"}
+    for base in candidates:
+        try:
+            r = httpx.get(f"{base}/models", headers=headers, timeout=0.8)
+            if r.status_code != 200:
+                continue
+            rows = r.json().get("data") or []
+            items: List[Dict[str, str]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                tr = str(row.get("transport") or "").strip().lower()
+                pid = str(row.get("provider") or "").strip().lower()
+                if tr not in _PRO_TRANSPORTS and pid not in _PRO_TRANSPORTS:
+                    continue
+                mid = str(row.get("id") or "").strip()
+                if not mid:
+                    continue
+                items.append({
+                    "model": mid,
+                    "name": str(row.get("name") or mid.split(":", 1)[-1]),
+                    "provider": str(row.get("provider") or "google-antigravity"),
+                    "provider_name": f"{row.get('provider_name') or 'Google Antigravity'} (柳如烟)",
+                })
+            _PRO_GW_CACHE.update({"ts": now, "base_url": base, "api_key": token, "items": items})
+            return base, token, items
+        except Exception:
+            continue
+
+    _PRO_GW_CACHE.update({"ts": now, "base_url": "", "api_key": "", "items": []})
+    return "", "", []
+
+
 def _gateway_models(gw: Dict[str, str]) -> List[Dict[str, str]]:
     headers = {}
     if gw.get("api_key"):
@@ -176,6 +269,63 @@ def current_fast_model() -> str:
     return current_model()
 
 
+_SUPPORTED_TRANSPORTS = ("openai_chat", "anthropic_messages")
+_NON_TEXT_TAGS = {"image_gen", "embedding", "audio", "tts", "asr", "rerank", "video"}
+
+
+def _is_text_model(m: Any) -> Tuple[str, str, bool]:
+    mid = (m.get("id") if isinstance(m, dict) else str(m)).strip()
+    mname = ((m.get("name") if isinstance(m, dict) else "") or mid).strip()
+    tags = {str(t).lower() for t in ((m.get("tags") if isinstance(m, dict) else []) or [])}
+    ok = bool(mid) and not (tags & _NON_TEXT_TAGS)
+    return mid, mname, ok
+
+
+def _normalize_anthropic_messages_url(base_url: str) -> str:
+    raw = (base_url or "").strip()
+    if not raw:
+        return ""
+    if raw.endswith("#"):
+        lit = raw[:-1].rstrip("/")
+        return lit if lit.endswith("/messages") else f"{lit}/messages"
+    clean = raw.rstrip("/")
+    if clean.endswith("/messages"):
+        return clean
+    clean = re.sub(r"/v\d+(?:alpha|beta)?$", "", clean, flags=re.I)
+    return f"{clean}/v1/messages"
+
+
+def _iter_provider_text_models(providers: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按有 api_key 优先遍历所有已启用且协议受支持的文本模型，避免无 key 渠道抢占同名模型。"""
+    entries: List[Dict[str, Any]] = []
+    for pid, pdata in providers.items():
+        if not pdata.get("enabled", True):
+            continue
+        tr = (pdata.get("transport") or "openai_chat").strip()
+        if tr not in _SUPPORTED_TRANSPORTS:
+            continue
+        base_url = (pdata.get("base_url") or "").strip()
+        if not base_url:
+            continue
+        api_key = (pdata.get("api_key") or "").strip()
+        pname = str(pdata.get("name") or pid)
+        for m in pdata.get("models") or []:
+            mid, mname, ok = _is_text_model(m)
+            if not ok:
+                continue
+            entries.append({
+                "model": mid,
+                "name": mname,
+                "provider": pid,
+                "provider_name": pname,
+                "transport": tr,
+                "base_url": base_url,
+                "api_key": api_key,
+            })
+    entries.sort(key=lambda e: (0 if e["api_key"] else 1))
+    return entries
+
+
 def list_text_models() -> List[Dict[str, str]]:
     st = settings_store.load_settings()
     custom = _load_custom_cfg()
@@ -205,27 +355,26 @@ def list_text_models() -> List[Dict[str, str]]:
                 seen.add(m)
                 out.append({"model": m, "name": m, "provider": "custom", "provider_name": "自定义 API"})
 
-    for pid, pdata in providers.items():
-        if not pdata.get("enabled", True):
+    for e in _iter_provider_text_models(providers):
+        mid = e["model"]
+        if mid in seen:
             continue
-        if (pdata.get("transport") or "openai_chat") != "openai_chat":
+        seen.add(mid)
+        out.append({
+            "model": mid,
+            "name": e["name"],
+            "provider": e["provider"],
+            "provider_name": e["provider_name"],
+        })
+
+    _pro_url, _pro_key, pro_items = _discover_liuruyan_pro_models()
+    for pitem in pro_items:
+        mid = pitem["model"]
+        if mid in seen:
             continue
-        if not (pdata.get("base_url") or "").strip():
-            continue
-        pname = str(pdata.get("name") or pid)
-        for m in pdata.get("models") or []:
-            mid = m.get("id") if isinstance(m, dict) else str(m)
-            mname = (m.get("name") if isinstance(m, dict) else "") or mid
-            tags = (m.get("tags") if isinstance(m, dict) else []) or []
-            if not mid or "image_gen" in tags or mid in seen:
-                continue
-            seen.add(mid)
-            out.append({
-                "model": mid,
-                "name": mname,
-                "provider": pid,
-                "provider_name": pname,
-            })
+        seen.add(mid)
+        out.append(pitem)
+
     if not out and (os.getenv("LLM_BASE_URL") or "").strip():
         mid = (os.getenv("LLM_MODEL") or "deepseek-chat").strip()
         out.append({"model": mid, "name": mid, "provider": "env", "provider_name": "环境变量"})
@@ -306,35 +455,97 @@ def build_model_catalog(selected_model: str = "") -> Dict[str, Any]:
                     "provider": "custom",
                 }
 
-    for pid, pdata in providers.items():
-        if not pdata.get("enabled", True):
+    for e in _iter_provider_text_models(providers):
+        mid = e["model"]
+        if mid in models:
             continue
-        if (pdata.get("transport") or "openai_chat") != "openai_chat":
-            continue
-        base_url = (pdata.get("base_url") or "").strip()
-        if not base_url:
-            continue
-        api_key = (pdata.get("api_key") or "").strip()
-        for m in pdata.get("models") or []:
-            mid = m.get("id") if isinstance(m, dict) else str(m)
-            tags = (m.get("tags") if isinstance(m, dict) else []) or []
-            if not mid or "image_gen" in tags or mid in models:
-                continue
-            models[mid] = {
-                "base_url": base_url,
-                "api_key": api_key,
-                "transport": "openai_chat",
-                "provider": pid,
-            }
-    default = (
-        (selected_model or "").strip()
-        or str(st.get("default_text_model") or "").strip()
-        or cur
+        models[mid] = {
+            "base_url": e["base_url"],
+            "api_key": e["api_key"],
+            "transport": e["transport"],
+            "provider": e["provider"],
+        }
+    direct_default = (
+        str(st.get("default_text_model") or "").strip()
+        or (cur if cur in models else "")
         or (os.getenv("LLM_MODEL") or "").strip()
     )
+    if direct_default not in models and models:
+        direct_default = next(iter(models))
+
+    pro_url, pro_key, pro_items = _discover_liuruyan_pro_models()
+    if pro_url and pro_items:
+        for pitem in pro_items:
+            mid = pitem["model"]
+            if mid in models:
+                continue
+            models[mid] = {
+                "base_url": pro_url,
+                "api_key": pro_key,
+                "transport": "openai_chat",
+                "provider": pitem["provider"],
+            }
+
+    sel = (selected_model or "").strip()
+    default = sel if sel in models else direct_default
     if default not in models and models:
         default = next(iter(models))
     return {"default": default, "models": models}
+
+
+def _single_anthropic_request(
+    base_url: str,
+    api_key: str,
+    target_model: str,
+    messages: List[Dict[str, str]],
+    temperature: float,
+    max_tokens: int,
+    timeout: int,
+) -> str:
+    url = _normalize_anthropic_messages_url(base_url)
+    headers = {
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+    }
+    if api_key:
+        headers["x-api-key"] = api_key
+    sys_parts: List[str] = []
+    anth_msgs: List[Dict[str, str]] = []
+    for m in messages:
+        role = str(m.get("role") or "user").strip().lower()
+        content = str(m.get("content") or "")
+        if not content:
+            continue
+        if role == "system":
+            sys_parts.append(content)
+            continue
+        r_norm = "assistant" if role == "assistant" else "user"
+        if anth_msgs and anth_msgs[-1]["role"] == r_norm:
+            anth_msgs[-1]["content"] += "\n\n" + content
+        else:
+            anth_msgs.append({"role": r_norm, "content": content})
+    if not anth_msgs:
+        anth_msgs = [{"role": "user", "content": "\n".join(sys_parts) or "Hello"}]
+        sys_parts = []
+    elif anth_msgs[0]["role"] != "user":
+        anth_msgs.insert(0, {"role": "user", "content": "请继续。"})
+    payload: Dict[str, Any] = {
+        "model": target_model,
+        "messages": anth_msgs,
+        "max_tokens": max(256, int(max_tokens or 2400)),
+        "temperature": temperature,
+    }
+    if sys_parts:
+        payload["system"] = "\n\n".join(sys_parts)
+    r = httpx.post(url, headers=headers, json=payload, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    blocks = data.get("content") or []
+    texts: List[str] = []
+    for b in blocks:
+        if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+            texts.append(str(b["text"]))
+    return "\n".join(texts).strip()
 
 
 def _single_chat_request(
@@ -345,7 +556,12 @@ def _single_chat_request(
     temperature: float,
     max_tokens: int,
     timeout: int,
+    transport: str = "openai_chat",
 ) -> str:
+    if transport == "anthropic_messages":
+        return _single_anthropic_request(
+            base_url, api_key, target_model, messages, temperature, max_tokens, timeout
+        )
     url = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -433,6 +649,7 @@ def chat_completion_with_meta(
                 temperature,
                 max_tokens,
                 timeout,
+                transport=str(cfg.get("transport") or "openai_chat"),
             )
             if text:
                 return text, mid

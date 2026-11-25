@@ -312,9 +312,11 @@ export default function TopicsView({ onOpenProject }: TopicsViewProps) {
         setIdea('')
         setSourceUrl('')
         setShowManual(false)
-        setMsg('✓ 已提炼标题并加入选题池')
+        const titleHint = d.topic?.raw_title ? `：「${d.topic.raw_title}」` : ''
+        setMsg(`✓ 已提炼标题并加入选题池${titleHint}`)
         setFilter('new')
-        await loadTopics('new')
+        setSourceFilter('')
+        await loadTopics('new', '')
       } else {
         setMsg(`✗ ${d.error || '添加失败'}`)
       }

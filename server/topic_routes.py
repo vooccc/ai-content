@@ -522,6 +522,7 @@ def _create_project_from_topic(topic_id: str, selected_title: str = "") -> Dict[
     if not src_records and tp.get("source_url"):
         src_records = [{"url": tp["source_url"], "title": tp["raw_title"], "ok": True}]
     state = {
+        "_wf": "content_pipeline",
         "inputs": inputs,
         "topic": chosen_title,
         "platform": "微信公众号",

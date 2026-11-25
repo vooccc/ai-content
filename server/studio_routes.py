@@ -33,7 +33,12 @@ def _load(pid: str):
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        proj = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(proj, dict) and proj.get("workflow"):
+            st = proj.setdefault("state", {})
+            if isinstance(st, dict) and not st.get("_wf"):
+                st["_wf"] = proj["workflow"]
+        return proj
     except Exception:
         return None
 
@@ -205,6 +210,11 @@ def rename_project(pid: str, req: RenameRequest):
         return JSONResponse({"ok": False, "error": "标题不能为空"}, status_code=400)
     proj["title"] = t[:60]
     proj.setdefault("inputs", {})["topic"] = t[:60]
+    st = proj.setdefault("state", {})
+    if isinstance(st, dict):
+        st["topic"] = t[:60]
+        if isinstance(st.get("inputs"), dict):
+            st["inputs"]["topic"] = t[:60]
     _save(proj)
     return {"ok": True, "title": proj["title"]}
 
@@ -463,6 +473,8 @@ async def run_step(pid: str, req: StepRequest):
         return await run_image_batch_step(proj, node, index, _m, _p, _save, _mark_done, _sse)
 
     state_payload = dict(proj.get("state") or {})
+    if not state_payload.get("_wf") and proj.get("workflow"):
+        state_payload["_wf"] = proj["workflow"]
     if proj.get("theme"):
         state_payload["_theme"] = proj["theme"]
     if proj.get("style"):

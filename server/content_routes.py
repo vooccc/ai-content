@@ -10,7 +10,7 @@ from fastapi import APIRouter, File, Form, UploadFile
 from pydantic import BaseModel
 
 from . import db, wechat_mp
-from .paths import content_config_path, studio_dir
+from .paths import content_config_path, data_dir, studio_dir
 
 router = APIRouter()
 
@@ -78,8 +78,8 @@ class WeChatDispatchRequest(BaseModel):
 
 
 def _resolve_studio_proxy_images(html_or_md: str) -> str:
-    """把工作台本地代理路径 /studio/projects/{pid}/image?path=... 还原为真实本地文件路径，便于上传微信图床。"""
-    if not html_or_md or "/studio/projects/" not in html_or_md:
+    """把工作台本地代理路径 /studio/projects/{pid}/image?path=... 或 /canvas/projects/{pid}/image?path=... 还原为真实本地文件路径，便于上传微信图床。"""
+    if not html_or_md or ("/studio/projects/" not in html_or_md and "/canvas/projects/" not in html_or_md):
         return html_or_md
 
     def _repl(m: re.Match) -> str:
@@ -94,7 +94,7 @@ def _resolve_studio_proxy_images(html_or_md: str) -> str:
             pass
         return raw_url
 
-    return re.sub(r"(?:https?://[^/\s\"']+)?/studio/projects/[^/\s\"']+/image\?[^\"'\s)]+", _repl, html_or_md)
+    return re.sub(r"(?:https?://[^/\s\"']+)?/(?:studio|canvas)/projects/[^/\s\"']+/image\?[^\"'\s)]+", _repl, html_or_md)
 
 
 @router.post("/content/upload-thumb")
@@ -143,10 +143,13 @@ def dispatch_wechat(req: WeChatDispatchRequest):
         topic_id = req.topic_id.strip()
         account_id = req.account_id.strip() or "primary"
         if req.project_id.strip():
-            proj_path = studio_dir() / f"{req.project_id.strip()}.json"
-            if proj_path.exists():
+            pid_clean = req.project_id.strip()
+            proj_path = studio_dir() / f"{pid_clean}.json"
+            canvas_path = data_dir() / "canvas" / f"{pid_clean}.json"
+            target_path = canvas_path if (pid_clean.startswith("c_") and canvas_path.exists()) else proj_path
+            if target_path.exists():
                 try:
-                    proj = json.loads(proj_path.read_text(encoding="utf-8"))
+                    proj = json.loads(target_path.read_text(encoding="utf-8"))
                     proj["draft_media_id"] = media_id
                     if not topic_id:
                         topic_id = str(proj.get("topic_id") or "")
@@ -154,7 +157,7 @@ def dispatch_wechat(req: WeChatDispatchRequest):
                         account_id = str(proj["account_id"])
                     if not eff_style:
                         eff_style = str(proj.get("theme") or proj.get("style") or "")
-                    proj_path.write_text(json.dumps(proj, ensure_ascii=False), encoding="utf-8")
+                    target_path.write_text(json.dumps(proj, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception:
                     pass
         art = db.record_article({

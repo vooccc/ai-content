@@ -6,6 +6,7 @@ import {
   type WorkbenchProps, stepLabel, goExternal, groupByProvider,
   card, inputStyle, goBtn, ghostBtn, COVER_MODEL_KEY,
 } from './StudioShell'
+import InlineTitleEditor from './InlineTitleEditor'
 
 interface MPlatform { key: string; name: string; emoji?: string; home: string; accounts: MPAccount[] }
 interface MPAccount { id: string; name: string; url?: string; appid?: string; secret?: string; thumb_media_id?: string }
@@ -373,24 +374,28 @@ export default function WechatWorkbench(p: WorkbenchProps) {
           </div>
         </div>
       )}
-      <div style={{ padding: '12px 18px', borderBottom: '1px solid rgba(127,127,127,0.18)', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        <button type="button" style={ghostBtn} onClick={p.onBack}>返回</button>
-        <div style={{ fontWeight: 600 }}>{proj.title}</div>
-        <span style={{ fontSize: 12, opacity: 0.6 }}>📄 {proj.name}</span>
-        <select value={p.txtPick} onChange={(e) => { const v = e.target.value; p.setTxtPick(v); p.saveSettings({ model: v }) }} title="本篇写作模型" style={{ ...inputStyle, padding: '5px 8px', fontSize: 12, maxWidth: 240, background: 'var(--bg-card)' }}>
-          <option value="">写作模型：默认{p.defaultModelName ? `（${p.defaultModelName}）` : ''}</option>
-          {groupByProvider(p.txtModels).map(([prov, ms]) => (<optgroup key={prov} label={prov}>{ms.map((m) => <option key={`${m.model}|${m.provider}`} value={m.model}>{m.name}</option>)}</optgroup>))}
-        </select>
-        <select value={p.stylePick} onChange={(e) => { const v = e.target.value; p.setStylePick(v); p.saveSettings({ style: v }) }} title={p.styleList.find((s) => s.id === p.stylePick)?.desc || '写作风格（默认=通用）'} style={{ ...inputStyle, padding: '5px 8px', fontSize: 12, maxWidth: 200, background: 'var(--bg-card)' }}>
-          <option value="">写作风格：默认</option>
-          {p.styleList.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-        </select>
-        <button type="button" onClick={p.openEditor} title="编辑 / 新建写作风格" style={{ ...ghostBtn, padding: '5px 10px', fontSize: 12 }}>✏️ 风格</button>
-        <button type="button" onClick={openCompare} title="搜公众号对标文章（选题参考）" style={{ ...ghostBtn, padding: '5px 10px', fontSize: 12 }}>🔍 对标</button>
-        <button type="button" style={{ ...goBtn, marginLeft: 'auto' }} disabled={busy}
-          onClick={() => { if (proj.current < proj.nodes.length) { runAll() } else if (window.confirm('重新成稿会从第一步开始覆盖现有全部内容，确定吗？')) { runAll(true) } }}>
-          {busy ? '运行中…' : (proj.current < proj.nodes.length ? '⚡ 一键成稿' : '↻ 重新成稿')}
-        </button>
+      <div style={{ padding: '10px 18px', borderBottom: '1px solid rgba(127,127,127,0.18)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+          <button type="button" style={{ ...ghostBtn, flexShrink: 0 }} onClick={p.onBack}>返回</button>
+          <InlineTitleEditor title={proj.title} onSave={p.renameCurrent} />
+          <span style={{ fontSize: 12, opacity: 0.6, flexShrink: 0 }}>📄 {proj.name}</span>
+          <button type="button" style={{ ...goBtn, flexShrink: 0 }} disabled={busy}
+            onClick={() => { if (proj.current < proj.nodes.length) { runAll() } else if (window.confirm('重新成稿会从第一步开始覆盖现有全部内容，确定吗？')) { runAll(true) } }}>
+            {busy ? '运行中…' : (proj.current < proj.nodes.length ? '⚡ 一键成稿' : '↻ 重新成稿')}
+          </button>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <select value={p.txtPick} onChange={(e) => { const v = e.target.value; p.setTxtPick(v); p.saveSettings({ model: v }) }} title="本篇写作模型" style={{ ...inputStyle, padding: '5px 8px', fontSize: 12, maxWidth: 260, background: 'var(--bg-card)' }}>
+            <option value="">写作模型：默认{p.defaultModelName ? `（${p.defaultModelName}）` : ''}</option>
+            {groupByProvider(p.txtModels).map(([prov, ms]) => (<optgroup key={prov} label={prov}>{ms.map((m) => <option key={`${m.model}|${m.provider}`} value={m.model}>{m.name}</option>)}</optgroup>))}
+          </select>
+          <select value={p.stylePick} onChange={(e) => { const v = e.target.value; p.setStylePick(v); p.saveSettings({ style: v }) }} title={p.styleList.find((s) => s.id === p.stylePick)?.desc || '写作风格（默认=通用）'} style={{ ...inputStyle, padding: '5px 8px', fontSize: 12, maxWidth: 200, background: 'var(--bg-card)' }}>
+            <option value="">写作风格：默认</option>
+            {p.styleList.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+          <button type="button" onClick={p.openEditor} title="编辑 / 新建写作风格" style={{ ...ghostBtn, padding: '5px 10px', fontSize: 12 }}>✏️ 风格</button>
+          <button type="button" onClick={openCompare} title="搜公众号对标文章（选题参考）" style={{ ...ghostBtn, padding: '5px 10px', fontSize: 12 }}>🔍 对标</button>
+        </div>
       </div>
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>

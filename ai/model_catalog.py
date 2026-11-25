@@ -73,5 +73,6 @@ def resolve_client(model: str = "") -> LLMClient:
             base_url=entry.get("base_url"),
             api_key=entry.get("api_key", ""),
             model=name,
+            transport=entry.get("transport", "openai_chat") or "openai_chat",
         )
     return LLMClient(model=name) if name else LLMClient()

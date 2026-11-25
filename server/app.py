@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .canvas_routes import router as canvas_router
 from .content_routes import router as content_router
 from .paths import data_dir, project_root
 from .publish_routes import router as publish_router
@@ -39,6 +40,7 @@ app.add_middleware(
 
 app.include_router(content_router)
 app.include_router(studio_router)
+app.include_router(canvas_router)
 app.include_router(publish_router)
 app.include_router(topic_router)
 

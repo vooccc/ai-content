@@ -1,8 +1,9 @@
 import { useState, type ReactNode } from 'react'
-import { BarChart3, Lightbulb, Moon, PanelLeftClose, PanelLeftOpen, PenLine, Settings, Sun, Zap } from 'lucide-react'
+import { BarChart3, Lightbulb, Moon, PanelLeftClose, PanelLeftOpen, PenLine, Settings, Sparkles, Sun, Zap } from 'lucide-react'
 import TopicsView from './TopicsView'
 import IntelView from './IntelView'
 import StudioShell from './studio/StudioShell'
+import CanvasShell from './canvas/CanvasShell'
 import PublishView from './PublishView'
 import MetricsView from './MetricsView'
 
@@ -11,12 +12,13 @@ interface ContentViewProps {
   onToggleTheme?: () => void
 }
 
-type NavTab = 'intel' | 'topics' | 'studio' | 'publish' | 'metrics'
+type NavTab = 'intel' | 'topics' | 'studio' | 'canvas' | 'publish' | 'metrics'
 
 const NAV_ITEMS: { key: NavTab; icon: ReactNode; label: string }[] = [
   { key: 'intel', icon: <Zap size={15} strokeWidth={1.9} />, label: '实时快讯' },
   { key: 'topics', icon: <Lightbulb size={15} strokeWidth={1.9} />, label: '选题池' },
   { key: 'studio', icon: <PenLine size={15} strokeWidth={1.9} />, label: '创作台' },
+  { key: 'canvas', icon: <Sparkles size={15} strokeWidth={1.9} />, label: '创作台·新版' },
   { key: 'publish', icon: <Settings size={15} strokeWidth={1.9} />, label: '账号与设置' },
   { key: 'metrics', icon: <BarChart3 size={15} strokeWidth={1.9} />, label: '数据复盘' },
 ]
@@ -27,6 +29,7 @@ export default function ContentView({ theme = 'dark', onToggleTheme }: ContentVi
     intel: false,
     topics: true,
     studio: false,
+    canvas: false,
     publish: false,
     metrics: false,
   })
@@ -190,6 +193,11 @@ export default function ContentView({ theme = 'dark', onToggleTheme }: ContentVi
               openProjectId={openProjectId}
               onConsumedOpenProject={() => setOpenProjectId(undefined)}
             />
+          </div>
+        )}
+        {visited.canvas && (
+          <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: tab === 'canvas' ? 'flex' : 'none' }}>
+            <CanvasShell />
           </div>
         )}
         {visited.publish && (

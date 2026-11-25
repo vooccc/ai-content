@@ -6,6 +6,7 @@ import {
   type WorkbenchProps, stepLabel, goExternal, groupByProvider,
   card, inputStyle, goBtn, ghostBtn, COVER_MODEL_KEY,
 } from './StudioShell'
+import InlineTitleEditor from './InlineTitleEditor'
 import CellCard from './xhs/CellCard'
 import { type PageLabels } from './xhs/composeCard'
 
@@ -209,19 +210,23 @@ export default function XhsWorkbench(p: WorkbenchProps) {
           <img src={previewUrl} alt="预览" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '92vw', maxHeight: '92vh', borderRadius: 12, boxShadow: '0 18px 60px rgba(0,0,0,0.55)' }} />
         </div>
       )}
-      <div style={{ padding: '12px 18px', borderBottom: '1px solid rgba(127,127,127,0.18)', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        <button type="button" style={ghostBtn} onClick={p.onBack}>返回</button>
-        <div style={{ fontWeight: 600 }}>{proj.title}</div>
-        <span style={{ fontSize: 12, opacity: 0.6 }}>📕 {proj.name}</span>
-        <select value={p.txtPick} onChange={(e) => { const v = e.target.value; p.setTxtPick(v); p.saveSettings({ model: v }) }} title="本篇写作模型" style={{ ...inputStyle, padding: '5px 8px', fontSize: 12, maxWidth: 240, background: 'var(--bg-card)' }}>
-          <option value="">写作模型：默认{p.defaultModelName ? `（${p.defaultModelName}）` : ''}</option>
-          {groupByProvider(p.txtModels).map(([prov, ms]) => (<optgroup key={prov} label={prov}>{ms.map((m) => <option key={`${m.model}|${m.provider}`} value={m.model}>{m.name}</option>)}</optgroup>))}
-        </select>
-        <select value={p.stylePick} onChange={(e) => { const v = e.target.value; p.setStylePick(v); p.saveSettings({ style: v }) }} title="写作风格" style={{ ...inputStyle, padding: '5px 8px', fontSize: 12, maxWidth: 200, background: 'var(--bg-card)' }}>
-          <option value="">写作风格：默认</option>
-          {p.styleList.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-        </select>
-        <button type="button" onClick={p.openEditor} title="编辑 / 新建写作风格" style={{ ...ghostBtn, padding: '5px 10px', fontSize: 12 }}>✏️ 风格</button>
+      <div style={{ padding: '10px 18px', borderBottom: '1px solid rgba(127,127,127,0.18)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+          <button type="button" style={{ ...ghostBtn, flexShrink: 0 }} onClick={p.onBack}>返回</button>
+          <InlineTitleEditor title={proj.title} onSave={p.renameCurrent} />
+          <span style={{ fontSize: 12, opacity: 0.6, flexShrink: 0 }}>📕 {proj.name}</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <select value={p.txtPick} onChange={(e) => { const v = e.target.value; p.setTxtPick(v); p.saveSettings({ model: v }) }} title="本篇写作模型" style={{ ...inputStyle, padding: '5px 8px', fontSize: 12, maxWidth: 260, background: 'var(--bg-card)' }}>
+            <option value="">写作模型：默认{p.defaultModelName ? `（${p.defaultModelName}）` : ''}</option>
+            {groupByProvider(p.txtModels).map(([prov, ms]) => (<optgroup key={prov} label={prov}>{ms.map((m) => <option key={`${m.model}|${m.provider}`} value={m.model}>{m.name}</option>)}</optgroup>))}
+          </select>
+          <select value={p.stylePick} onChange={(e) => { const v = e.target.value; p.setStylePick(v); p.saveSettings({ style: v }) }} title="写作风格" style={{ ...inputStyle, padding: '5px 8px', fontSize: 12, maxWidth: 200, background: 'var(--bg-card)' }}>
+            <option value="">写作风格：默认</option>
+            {p.styleList.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
+          </select>
+          <button type="button" onClick={p.openEditor} title="编辑 / 新建写作风格" style={{ ...ghostBtn, padding: '5px 10px', fontSize: 12 }}>✏️ 风格</button>
+        </div>
       </div>
 
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>

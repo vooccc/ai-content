@@ -551,7 +551,7 @@ def _score_and_rewrite_chunk(
         + f"\n【候选素材（共 {len(brief_list)} 条）】\n"
         + json.dumps(brief_list, ensure_ascii=False, indent=2)
         + f"\n\n【筛选规则】\n"
-        "1. 必须评估 is_real：遇到无实质内容的标题党、SEO 内容农场洗稿、纯情绪焦虑贩卖或无来源传闻，设 is_real=false 直接淘汰。\n"
+        "1. 必须评估 is_real：遇到无实质内容的标题党、SEO 内容农场洗稿、纯情绪焦虑贩卖或无来源传闻，设 is_real=false 直接淘汰（但若 source 以「灵感投喂」开头，属于用户主动指定素材，必须设 is_real=true）。\n"
         "2. 优先保留有客观热度（popularity 高）、命中 matched_terms 或跨多源共振（resonance_sources 非空）且能写实操步骤/避坑/测评的选题。\n"
         "3. 兼顾信源多样性，避免单一平台霸榜（X、小红书、GitHub、B站、RSS 的高价值代表都尽量保留）。\n"
         f"4. 挑选最契合的最多 {chunk_top_n} 条，每条返回 JSON 对象：\n"
@@ -851,48 +851,82 @@ def enrich_topic_engagement(topic_id: str) -> Dict[str, Any]:
 
 
 def create_manual_topic(idea: str, source_url: str = "") -> Dict[str, Any]:
-    """手动投喂灵感或 URL：自动抓摘要 + 生成 3 个高打开率标题并入选题池。"""
+    """手动投喂灵感或 URL：自动抓标题/正文/互动数据 + 生成 3 个高打开率标题并置顶入选题池。"""
     account = db.get_primary_account()
-    raw_title = (idea or "").strip()
-    raw_summary = ""
+    raw_idea = (idea or "").strip()
     url = (source_url or "").strip()
-    if url and not raw_title:
-        raw_title = url
+    if not url and (raw_idea.startswith("http://") or raw_idea.startswith("https://")) and " " not in raw_idea:
+        url = raw_idea
+        raw_idea = ""
+
+    raw_title = raw_idea
+    raw_summary = ""
+    source_name = "灵感投喂"
+    engagement: Dict[str, Any] = {}
+    engagement_badge = ""
+    popularity = 0
 
     if url.startswith("http://") or url.startswith("https://"):
-        try:
-            fetched = search_gather.fetch_url_text(url)
-            if fetched.get("ok"):
-                if not raw_title or raw_title == url:
-                    raw_title = str(fetched.get("title") or url).strip()
-                raw_summary = str(fetched.get("content") or "")[:1200]
-        except Exception:
-            pass
+        if "xiaohongshu.com" in url.lower():
+            try:
+                sc = (account.get("sources_config") or {})
+                detail = sources.fetch_xiaohongshu_note_detail(url, mode=str(sc.get("xhs_mode") or "auto"))
+                if detail:
+                    if not raw_title:
+                        raw_title = str(detail.get("title") or "").strip()
+                    if detail.get("author"):
+                        source_name = f"灵感投喂·{detail['author']}"
+                    engagement = detail.get("engagement") or {}
+                    engagement_badge = str(detail.get("engagement_badge") or "")
+                    popularity = int(detail.get("likes") or 0) + int(detail.get("collects") or 0) * 2 + int(detail.get("comments") or 0) * 3
+                    body = str(detail.get("content") or "").strip()
+                    if body:
+                        raw_summary = (f"{engagement_badge} · " if engagement_badge else "") + body[:12000]
+            except Exception:
+                pass
+        if not raw_summary or not raw_title:
+            try:
+                fetched = search_gather.fetch_url_text(url, max_chars=15000)
+                if fetched.get("ok"):
+                    if not raw_title and fetched.get("title"):
+                        raw_title = str(fetched["title"]).strip()
+                    if fetched.get("author") and source_name == "灵感投喂":
+                        source_name = f"灵感投喂·{fetched['author']}"
+                    if not raw_summary and fetched.get("content"):
+                        raw_summary = str(fetched["content"])[:12000]
+            except Exception:
+                pass
 
+    if not raw_title:
+        raw_title = url or "手动灵感"
     if not raw_summary:
         raw_summary = raw_title
 
     candidate = {
         "source_type": "manual",
-        "source_name": "灵感投喂",
+        "source_name": source_name,
         "source_url": url,
         "raw_title": raw_title[:120],
         "raw_summary": raw_summary,
-        "popularity": 0,
-        "matched_terms": [raw_title[:20]],
+        "popularity": popularity,
+        "engagement": engagement,
+        "engagement_badge": engagement_badge,
+        "matched_terms": [raw_title[:24]],
         "resonance_sources": [],
     }
     scored = _score_and_rewrite_with_llm([candidate], account, top_n=1)
     item = scored[0] if scored else _heuristic_score_item(candidate, account)
-    item["score"] = max(80, int(item.get("score") or 80))
+    item["score"] = max(99, int(item.get("score") or 99))
     return db.insert_topic({
         "account_id": account["id"],
         "source_type": "manual",
-        "source_name": "灵感投喂",
+        "source_name": source_name,
         "source_url": url,
         "raw_title": item["raw_title"],
         "raw_summary": raw_summary,
         "suggested_titles": item.get("suggested_titles") or [raw_title],
+        "engagement_badge": engagement_badge,
+        "engagement": engagement,
         "angle": item.get("angle") or "",
         "reason": item.get("reason") or "手动投喂灵感，优先排入待写队列",
         "category": item.get("category") or "周二实操",
